@@ -139,3 +139,38 @@
 |Контейнеризация|Docker, Docker Compose|
 |Управление зависимостями|Poetry (Python), npm (JS)|
 |Версионирование|Git (GitHub)|
+
+## GeoIP Setup
+
+NodeArgus использует локальную базу MaxMind GeoLite2-City и не обращается к
+внешним API во время определения геолокации.
+
+### Получение license key
+
+1. Создайте бесплатную учетную запись на [странице регистрации MaxMind](https://www.maxmind.com/en/geolite2/signup).
+2. В профиле MaxMind создайте license key для GeoLite2.
+3. Сохраните ключ в `.env`:
+
+```env
+GEOIP_LICENSE_KEY=your-maxmind-license-key
+GEOIP_MIRROR_URL=
+GEOIP_DB_PATH=data/GeoLite2-City.mmdb
+GEOIP_AUTO_UPDATE=false
+```
+
+### Первоначальная загрузка
+
+```bash
+python backend/scripts/download_geoip.py --license-key "$GEOIP_LICENSE_KEY"
+```
+
+Также можно вручную скачать архив GeoLite2-City с MaxMind, распаковать файл
+`GeoLite2-City.mmdb` в `data/` и оставить `GEOIP_LICENSE_KEY` пустым.
+Для автоматической загрузки из доверенного зеркала без ключа задайте URL
+архива в `GEOIP_MIRROR_URL`.
+
+### Автообновление
+
+Для проверки срока базы создайте downloader и вызовите `update_if_needed()`.
+Параметр `GEOIP_AUTO_UPDATE=true` предназначен для подключения этой проверки
+к планировщику задач на следующем этапе проекта.

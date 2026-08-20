@@ -46,6 +46,7 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
+      - ./data:/app/data
     working_dir: /app
     environment:
       DATABASE_HOST: postgres
@@ -53,8 +54,55 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      POSTGRES_ASYNC_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      GEOIP_DB_PATH: ${GEOIP_DB_PATH:-data/GeoLite2-City.mmdb}
+      GEOIP_LICENSE_KEY: ${GEOIP_LICENSE_KEY:-}
+      GEOIP_MIRROR_URL: ${GEOIP_MIRROR_URL:-}
+      GEOIP_AUTO_UPDATE: ${GEOIP_AUTO_UPDATE:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nodeargus-net
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nodeargus-celery-worker
+    restart: unless-stopped
+    user: root
+    cap_add:
+      - NET_RAW
+    command: celery -A app.celery_worker worker --loglevel=info
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+    working_dir: /app
+    environment:
+      TZ: Europe/Moscow
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      POSTGRES_ASYNC_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      GEOIP_DB_PATH: ${GEOIP_DB_PATH:-data/GeoLite2-City.mmdb}
+      GEOIP_LICENSE_KEY: ${GEOIP_LICENSE_KEY:-}
+      GEOIP_MIRROR_URL: ${GEOIP_MIRROR_URL:-}
+      GEOIP_AUTO_UPDATE: ${GEOIP_AUTO_UPDATE:-false}
     depends_on:
       postgres:
         condition: service_healthy

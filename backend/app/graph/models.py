@@ -1,0 +1,30 @@
+from pydantic import BaseModel, ConfigDict
+
+
+class GraphNode(BaseModel):
+    """A node displayed in the network graph."""
+
+    id: str
+    ip: str
+    country: str | None = None
+    city: str | None = None
+    os: str | None = None
+    ports_count: int
+
+
+class GraphLink(BaseModel):
+    """A typed relationship between two graph nodes."""
+
+    source: str
+    target: str
+    type: str
+
+
+class GraphResponse(BaseModel):
+    """Graph data for one center IP and its immediate relationships."""
+
+    center_ip: str
+    nodes: list[GraphNode]
+    links: list[GraphLink]
+
+    model_config = ConfigDict(from_attributes=True)

@@ -1,0 +1,5 @@
+.env
+data/*.mmdb
+__pycache__/
+*.py[cod]
+.coverage
