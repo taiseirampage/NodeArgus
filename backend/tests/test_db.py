@@ -128,6 +128,8 @@ async def test_save_scan_result_persists_geo_and_services(
             )
         ],
         scan_time=0.5,
+        scripts_output={"http-title": "Title: Example"},
+        traceroute=[],
     )
     geo = GeoLocation(
         ip="8.8.8.8",
@@ -146,6 +148,7 @@ async def test_save_scan_result_persists_geo_and_services(
     assert record.country_code == "US"
     assert record.provider == "Example ISP"
     assert record.os == "Linux"
+    assert record.scripts_info == {"http-title": "Title: Example"}
     assert ports[0].banner == "nginx 1.25"
 
 

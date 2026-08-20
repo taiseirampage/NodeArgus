@@ -1,7 +1,16 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    false,
+    func,
+)
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
@@ -41,6 +50,15 @@ class IP(Base):
     longitude: Mapped[float | None] = mapped_column(nullable=True)
     provider: Mapped[str | None] = mapped_column(String(255), nullable=True)
     os: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    scripts_info: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
+    traceroute: Mapped[list[dict[str, object]] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    is_traceroute_hop: Mapped[bool] = mapped_column(
+        nullable=False, server_default=false()
+    )
+    traceroute_hop: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    traceroute_rtt: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_scan: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -69,6 +87,9 @@ class Port(Base):
     protocol: Mapped[str] = mapped_column(String(8), nullable=False)
     service: Mapped[str] = mapped_column(String(128), nullable=False)
     banner: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="unknown"
+    )
 
     ip: Mapped[IP] = relationship(back_populates="ports")
 
@@ -97,12 +118,21 @@ class Link(Base):
 
 class Vulnerability(Base):
     __tablename__ = "vulnerabilities"
+    __table_args__ = (
+        CheckConstraint(
+            "severity IN ('critical', 'high', 'medium', 'low', 'info')",
+            name="valid_vulnerability_severity",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ip_id: Mapped[int] = mapped_column(ForeignKey("ips.id", ondelete="CASCADE"))
-    cve_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    template_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    cve_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
     description: Mapped[str] = mapped_column(String(4096), nullable=False)
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    matched_at: Mapped[str] = mapped_column(String(2048), nullable=False)
     found_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

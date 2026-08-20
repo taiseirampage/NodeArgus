@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.scanner.masscan_wrapper import run_masscan
-from app.scanner.nmap_wrapper import run_nmap
+from app.scanner.nmap_wrapper import _scan_port_spec, run_nmap
 from app.scanner.validator import validate_target
 
 
@@ -69,6 +69,11 @@ def test_validate_ports_rejects_unsafe_specs(ports: str) -> None:
 
     with pytest.raises(ValueError):
         validate_ports(ports)
+
+
+def test_nmap_port_spec_keeps_masscan_ports_and_adds_os_discovery_range() -> None:
+    assert _scan_port_spec("80,443,8080") == "1-1024,12345,54321,80,443,8080"
+    assert _scan_port_spec("1-1024,12345") == "1-1024,12345,54321"
 
 
 def test_masscan_wrapper_uses_validated_arguments() -> None:
@@ -276,6 +281,52 @@ def test_nmap_wrapper_reads_service_dict_name() -> None:
     assert result.services[0].service == "https"
 
 
+def test_nmap_wrapper_parses_deep_scan_metadata() -> None:
+    process = SimpleNamespace(
+        stdout=(
+            "<nmaprun><host><trace>"
+            '<hop ttl="1" ipaddr="192.0.2.254" host="gateway" rtt="1.2"/>'
+            "</trace></host></nmaprun>"
+        ),
+        run=MagicMock(),
+    )
+    nmap_process_module = ModuleType("libnmap.process")
+    nmap_process_module.NmapProcess = lambda **kwargs: process  # type: ignore[attr-defined]
+    service = SimpleNamespace(
+        port=80,
+        protocol="tcp",
+        service="http",
+        service_product="nginx",
+        service_version="1.25",
+        scripts_results=[{"id": "http-title", "output": "Title: Example"}],
+    )
+    host = SimpleNamespace(
+        services=[service],
+        scripts_results=[{"id": "ssl-cert", "output": "Issuer: Example CA"}],
+        os=SimpleNamespace(
+            osmatches=[SimpleNamespace(name="Linux 5.4", accuracy="95")]
+        ),
+    )
+    nmap_parser_module = ModuleType("libnmap.parser")
+    nmap_parser_module.NmapParser = SimpleNamespace(  # type: ignore[attr-defined]
+        parse=lambda output: SimpleNamespace(hosts=[host])
+    )
+
+    with patch(
+        "app.scanner.nmap_wrapper.importlib.import_module",
+        side_effect=[nmap_process_module, nmap_parser_module],
+    ):
+        result = run_nmap("192.0.2.1", ports="80")
+
+    assert result.os_detection == "Linux 5.4 (95%)"
+    assert result.scripts_output == {
+        "80/tcp:http-title": "Title: Example",
+        "ssl-cert": "Issuer: Example CA",
+    }
+    assert result.traceroute[0].ip == "192.0.2.254"
+    assert result.traceroute[0].hostname == "gateway"
+
+
 def test_nmap_wrapper_parses_empty_report() -> None:
     process = SimpleNamespace(stdout="<nmaprun />", run=MagicMock())
     nmap_process_module = ModuleType("libnmap.process")
@@ -292,7 +343,7 @@ def test_nmap_wrapper_parses_empty_report() -> None:
         result = run_nmap("192.168.1.1")
 
     assert result.services == []
-    assert result.os_detection == ""
+    assert result.os_detection == "Unknown (Filtered)"
 
 
 def test_nmap_wrapper_rejects_broken_xml_response() -> None:

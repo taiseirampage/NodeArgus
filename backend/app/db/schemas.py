@@ -10,6 +10,7 @@ class PortCreate(BaseModel):
     protocol: str
     service: str
     banner: str | None = None
+    state: str = "unknown"
 
 
 class PortResponse(PortCreate):
@@ -27,6 +28,8 @@ class IPCreate(BaseModel):
     longitude: float | None = None
     provider: str | None = None
     os: str | None = None
+    scripts_info: dict[str, str] | None = None
+    traceroute: list[dict[str, object]] | None = None
     last_scan: datetime | None = None
 
     @field_validator("ip_address")
@@ -53,6 +56,7 @@ class PortDetailsResponse(BaseModel):
     protocol: str
     service: str
     banner: str | None = None
+    state: str = "unknown"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -65,6 +69,8 @@ class IPDetailsResponse(BaseModel):
     city: str | None = None
     os: str | None = None
     provider: str | None = None
+    scripts_info: dict[str, str] = Field(default_factory=dict)
+    traceroute: list[dict[str, object]] = Field(default_factory=list)
     ports: list[PortDetailsResponse] = Field(default_factory=list)
 
 
@@ -90,9 +96,12 @@ class LinkResponse(LinkCreate):
 
 class VulnerabilityCreate(BaseModel):
     ip_id: int
-    cve_id: str
+    template_id: str
+    cve_id: str | None = None
+    name: str
     description: str
     severity: str
+    matched_at: str
 
 
 class VulnerabilityResponse(VulnerabilityCreate):

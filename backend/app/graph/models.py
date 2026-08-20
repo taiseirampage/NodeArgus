@@ -10,6 +10,9 @@ class GraphNode(BaseModel):
     city: str | None = None
     os: str | None = None
     ports_count: int
+    is_traceroute_hop: bool = False
+    traceroute_hop: int | None = None
+    traceroute_rtt: str | None = None
 
 
 class GraphLink(BaseModel):

@@ -1,34 +1,47 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState, type ReactElement } from 'react'
 import { ScanForm } from './components/ScanForm'
 import { NetworkGraph } from './components/NetworkGraph'
 import { NodeDetailsPanel } from './components/NodeDetailsPanel'
 import { TaskStatus } from './components/TaskStatus'
 
-const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
+const SCANNED_IPS_STORAGE_KEY = 'nodeargus.scannedIps'
 
-function App() {
+function loadScannedIps(): string[] {
+  try {
+    const stored = window.localStorage.getItem(SCANNED_IPS_STORAGE_KEY)
+    if (!stored) return []
+    const parsed: unknown = JSON.parse(stored)
+    if (!Array.isArray(parsed)) return []
+    return Array.from(new Set(parsed.filter((value): value is string => typeof value === 'string' && value.length > 0)))
+  } catch {
+    return []
+  }
+}
+
+function App(): ReactElement {
   const [scanTask, setScanTask] = useState<{ id: string; targetIp: string } | null>(null)
-  const [currentGraphIp, setCurrentGraphIp] = useState<string | null>(null)
+  const [scannedIps, setScannedIps] = useState<string[]>(loadScannedIps)
   const [selectedIp, setSelectedIp] = useState<string | null>(null)
   const handleGraphReady = useCallback((targetIp: string): void => {
-    setCurrentGraphIp(targetIp)
+    setScannedIps((currentIps) => [...currentIps.filter((ip) => ip !== targetIp), targetIp])
   }, [])
   const handleNodeClick = useCallback((ip: string): void => {
     setSelectedIp(ip)
   }, [])
-  const handleScanVuln = useCallback(async (ip: string): Promise<void> => {
-    const message = `Задача на сканирование уязвимостей для ${ip} отправлена`
-    try {
-      const response = await fetch(`${API_BASE_URL}/vuln/${encodeURIComponent(ip)}`, {
-        method: 'POST',
-      })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      window.alert(message)
-    } catch (error) {
-      console.info(`${message} (заглушка)`, error)
-      window.alert(`${message} (заглушка)`)
-    }
+  const clearGraph = useCallback((): void => {
+    setScannedIps([])
+    setSelectedIp(null)
   }, [])
+
+  useEffect(() => {
+    if (scannedIps.length === 0) {
+      window.localStorage.removeItem(SCANNED_IPS_STORAGE_KEY)
+      return
+    }
+    window.localStorage.setItem(SCANNED_IPS_STORAGE_KEY, JSON.stringify(scannedIps))
+  }, [scannedIps])
+
+  const latestScannedIp = scannedIps[scannedIps.length - 1] ?? null
 
   return (
     <main className="relative min-h-screen overflow-hidden px-5 py-6 text-slate-100 sm:px-8 sm:py-10">
@@ -75,16 +88,29 @@ function App() {
           />
         </section>
 
-        {currentGraphIp && (
+        {scannedIps.length > 0 && (
           <section className="mt-5 rounded-3xl border border-white/10 bg-slate-950/75 p-6 shadow-2xl shadow-black/20 backdrop-blur-xl sm:p-8">
             <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
               <div>
                 <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-slate-500">03 / Network topology</p>
                 <h2 className="mt-2 font-display text-2xl font-medium text-white">Live neighborhood</h2>
               </div>
-              <span className="font-mono text-xs text-cyan-300">center // {currentGraphIp}</span>
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="font-mono text-xs text-cyan-300">targets // {scannedIps.length}</span>
+                <button
+                  type="button"
+                  onClick={clearGraph}
+                  className="rounded-lg border border-rose-300/20 px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-rose-200 transition hover:border-rose-300/50 hover:bg-rose-300/10"
+                >
+                  Очистить граф
+                </button>
+              </div>
             </div>
-            <NetworkGraph targetIp={currentGraphIp} onNodeClick={handleNodeClick} />
+            <NetworkGraph
+              allScannedIps={scannedIps}
+              latestScannedIp={latestScannedIp}
+              onNodeClick={handleNodeClick}
+            />
           </section>
         )}
 
@@ -96,7 +122,6 @@ function App() {
       <NodeDetailsPanel
         ip={selectedIp}
         onClose={() => setSelectedIp(null)}
-        onScanVuln={handleScanVuln}
       />
     </main>
   )

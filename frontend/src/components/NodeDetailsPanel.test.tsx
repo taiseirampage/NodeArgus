@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { NodeDetailsPanel } from './NodeDetailsPanel'
 
@@ -20,17 +20,66 @@ describe('NodeDetailsPanel request lifecycle', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const view = render(
-      <NodeDetailsPanel ip="192.168.1.10" onClose={() => undefined} onScanVuln={() => undefined} />,
+      <NodeDetailsPanel ip="192.168.1.10" onClose={() => undefined} />,
     )
     await waitFor(() => expect(signals).toHaveLength(1))
 
     view.rerender(
-      <NodeDetailsPanel ip="192.168.1.20" onClose={() => undefined} onScanVuln={() => undefined} />,
+      <NodeDetailsPanel ip="192.168.1.20" onClose={() => undefined} />,
     )
     await waitFor(() => expect(signals).toHaveLength(2))
 
     expect(signals[0].aborted).toBe(true)
     view.unmount()
     expect(signals[1].aborted).toBe(true)
+  })
+
+  it('polls vulnerability status and stops after a terminal result', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn()
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ip: '192.168.1.10',
+        country: null,
+        city: null,
+        os: null,
+        provider: null,
+        ports: [],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ task_id: 'vuln-task-1', status: 'queued' }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ task_id: 'vuln-task-1', status: 'processing' }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        task_id: 'vuln-task-1',
+        status: 'success',
+        vulnerabilities: [],
+        message: null,
+      }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<NodeDetailsPanel ip="192.168.1.10" onClose={() => undefined} />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /запустить поиск уязвимостей/i }))
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(screen.getByText('Сканирование...')).toBeTruthy()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(screen.getByText('Уязвимостей не обнаружено')).toBeTruthy()
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000)
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    vi.useRealTimers()
   })
 })

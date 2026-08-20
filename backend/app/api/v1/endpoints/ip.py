@@ -46,5 +46,7 @@ async def get_ip_details(
         city=record.city,
         os=record.os,
         provider=record.provider,
+        scripts_info=record.scripts_info or {},
+        traceroute=record.traceroute or [],
         ports=[PortDetailsResponse.model_validate(port) for port in ports],
     )

@@ -81,10 +81,42 @@ async def _get_explicit_links(
     if not ids:
         return []
     statement = select(Link.source_ip_id, Link.target_ip_id, Link.link_type).where(
-        or_(Link.source_ip_id.in_(ids), Link.target_ip_id.in_(ids))
+        or_(Link.source_ip_id.in_(ids), Link.target_ip_id.in_(ids)),
+        Link.link_type != "traceroute_hop",
     )
     result = await db.execute(statement)
     return [(row[0], row[1], row[2]) for row in result.all()]
+
+
+async def _get_traceroute_links(
+    db: AsyncSession, node_ids: Iterable[int]
+) -> list[tuple[int, int, str]]:
+    """Return the complete traceroute components containing selected nodes."""
+    selected_ids = set(node_ids)
+    if not selected_ids:
+        return []
+    result = await db.execute(
+        select(Link.source_ip_id, Link.target_ip_id, Link.link_type).where(
+            Link.link_type == "traceroute_hop"
+        )
+    )
+    links = [(row[0], row[1], row[2]) for row in result.all()]
+    adjacency: dict[int, set[int]] = {}
+    for source_id, target_id, _ in links:
+        adjacency.setdefault(source_id, set()).add(target_id)
+        adjacency.setdefault(target_id, set()).add(source_id)
+
+    component_ids = set(selected_ids)
+    pending = list(selected_ids)
+    while pending:
+        current = pending.pop()
+        for neighbor in adjacency.get(current, set()):
+            if neighbor not in component_ids:
+                component_ids.add(neighbor)
+                pending.append(neighbor)
+    return [
+        link for link in links if link[0] in component_ids and link[1] in component_ids
+    ]
 
 
 async def _get_port_counts(db: AsyncSession, node_ids: Iterable[int]) -> dict[int, int]:
@@ -121,13 +153,17 @@ async def _load_linked_records(
 
 def _node_from_record(record: IP, port_counts: dict[int, int]) -> GraphNode:
     ip = str(record.ip_address)
+    ports_count = port_counts.get(record.id, 0)
     return GraphNode(
         id=ip,
         ip=ip,
         country=record.country,
         city=record.city,
         os=record.os,
-        ports_count=port_counts.get(record.id, 0),
+        ports_count=ports_count,
+        is_traceroute_hop=record.is_traceroute_hop and ports_count == 0,
+        traceroute_hop=record.traceroute_hop,
+        traceroute_rtt=record.traceroute_rtt,
     )
 
 
@@ -201,6 +237,9 @@ async def compute_graph(db: AsyncSession, target_ip: str) -> GraphResponse:
     records_by_id = {record.id: record for record in selected + candidates}
     node_ids = list(records_by_id)
     explicit_links = await _get_explicit_links(db, node_ids)
+    explicit_links.extend(
+        await _get_traceroute_links(db, [record.id for record in selected])
+    )
     linked_ids = await _load_linked_records(db, explicit_links, records_by_id)
     ordered_ids = node_ids + [
         record_id for record_id in linked_ids if record_id not in node_ids

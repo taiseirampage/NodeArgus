@@ -29,6 +29,7 @@ class NmapService(BaseModel):
     service: str
     version: str
     os_match: str = ""
+    state: str = "unknown"
 
 
 class NmapResult(BaseModel):
@@ -36,6 +37,17 @@ class NmapResult(BaseModel):
 
     target: str
     services: list[NmapService]
-    os_detection: str
+    os_detection: str = ""
     scan_time: float = Field(ge=0)
     geo: GeoLocation | None = None
+    scripts_output: dict[str, str] = Field(default_factory=dict)
+    traceroute: list["NmapHop"] = Field(default_factory=list)
+
+
+class NmapHop(BaseModel):
+    """One hop from the Nmap traceroute output."""
+
+    ttl: int = Field(ge=1)
+    ip: str | None = None
+    hostname: str | None = None
+    rtt: str | None = None

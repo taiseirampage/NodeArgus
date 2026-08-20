@@ -81,6 +81,7 @@ services:
     user: root
     cap_add:
       - NET_RAW
+      - NET_ADMIN
     command: celery -A app.celery_worker worker --loglevel=info
     volumes:
       - ./backend:/app
