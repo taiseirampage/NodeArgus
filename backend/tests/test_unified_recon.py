@@ -7,6 +7,7 @@ from app.schemas.scan import ScanRequest
 from app.tasks.recon import (
     _merge_recon_subdomains,
     _persist_unified_recon,
+    _recon_progress,
     run_unified_recon_task,
 )
 
@@ -35,6 +36,24 @@ def test_merge_recon_subdomains_deduplicates_and_marks_sources() -> None:
 
 def test_merge_recon_subdomains_empty_input() -> None:
     assert _merge_recon_subdomains([], []) == []
+
+
+def test_recon_progress_skips_when_request_id_missing() -> None:
+    task = MagicMock()
+    task.request.id = None
+    task.update_state = MagicMock(side_effect=ValueError("task_id must not be empty"))
+    _recon_progress(task, {"subfinder": "running"})
+    task.update_state.assert_not_called()
+
+
+def test_recon_progress_writes_when_request_id_present() -> None:
+    task = MagicMock()
+    task.request.id = "task-123"
+    task.update_state = MagicMock()
+    _recon_progress(task, {"subfinder": "running"})
+    task.update_state.assert_called_once_with(
+        state="PROGRESS", meta={"progress": {"subfinder": "running"}}
+    )
 
 
 @pytest.mark.asyncio
@@ -84,24 +103,57 @@ async def test_persist_unified_recon_resolves_and_saves() -> None:
 def test_unified_recon_invalid_domain_fails() -> None:
     with (
         patch("app.tasks.recon.validate_domain", side_effect=ValueError("bad")),
-        patch.object(run_unified_recon_task, "update_state") as update_state,
-        pytest.raises(ValueError),
+        pytest.raises(ValueError, match="bad"),
     ):
         _execute_task("not a domain; rm -rf /")
 
-    update_state.assert_called_once_with(state="FAILURE", meta={"error": "bad"})
-
 
 def test_unified_recon_requires_at_least_one_tool() -> None:
-    with (
-        patch.object(run_unified_recon_task, "update_state") as update_state,
-        pytest.raises(ValueError, match="recon_tools"),
-    ):
+    with pytest.raises(ValueError, match="recon_tools"):
         _execute_task("example.com", recon_tools=[])
 
-    update_state.assert_called_once_with(
-        state="FAILURE", meta={"error": "no recon tools selected"}
-    )
+
+def test_unified_recon_degrades_when_amass_disabled() -> None:
+    subfinder_child = MagicMock()
+    subfinder_child.state = "SUCCESS"
+    subfinder_child.ready.return_value = True
+    subfinder_child.result = ["a.example.com"]
+    amass_child = MagicMock()
+    amass_child.state = "SUCCESS"
+    amass_child.ready.return_value = True
+    amass_child.result = {"error": "active recon is disabled"}
+    group_result = MagicMock()
+    group_result.results = [subfinder_child, amass_child]
+    group_result.apply_async.return_value = group_result
+    persisted = {
+        "domain": "example.com",
+        "total_subdomains": 1,
+        "unique_ips": 1,
+        "tools_used": ["amass", "subfinder"],
+        "asn_info": [],
+    }
+
+    with (
+        patch("app.tasks.recon.validate_domain", return_value="example.com"),
+        patch("app.tasks.recon.group", return_value=group_result),
+        patch(
+            "app.tasks.recon._persist_unified_recon",
+            new_callable=AsyncMock,
+            return_value=persisted,
+        ) as persist,
+        patch.object(run_unified_recon_task, "update_state"),
+        patch("app.tasks.recon._run_async", side_effect=asyncio.run),
+        patch("app.tasks.recon.time.sleep"),
+    ):
+        result = _execute_task(
+            "example.com",
+            recon_tools=["subfinder", "amass"],
+            amass_mode="active",
+        )
+
+    assert result["status"] == "partial"
+    assert persist.call_args.args[1][0]["name"] == "a.example.com"
+    assert result["tool_errors"] == {"amass": "active recon is disabled"}
 
 
 def test_unified_recon_dispatches_group_and_merges() -> None:

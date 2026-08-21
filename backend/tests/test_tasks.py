@@ -264,11 +264,6 @@ def test_run_scan_task_marks_invalid_target_as_failure() -> None:
             "app.tasks.scan.validate_target",
             side_effect=ValueError("invalid target"),
         ),
-        patch.object(run_scan_task, "update_state") as update_state,
         pytest.raises(ValueError, match="invalid target"),
     ):
         run_scan_task.run("192.168.1.1; rm -rf /")
-
-    update_state.assert_called_once_with(
-        state="FAILURE", meta={"error": "invalid target"}
-    )

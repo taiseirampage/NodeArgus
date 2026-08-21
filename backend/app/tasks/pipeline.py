@@ -89,5 +89,4 @@ def run_full_scan_task(
         }
     except Exception as error:
         logger.exception("Full scan pipeline failed for target %s", target)
-        self.update_state(state="FAILURE", meta={"error": str(error)})
         raise

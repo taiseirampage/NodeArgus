@@ -82,14 +82,9 @@ def test_run_amass_task_marks_failure_on_error() -> None:
             new_callable=AsyncMock,
             side_effect=AmassError("amass binary is not installed"),
         ),
-        patch.object(run_amass_task, "update_state") as update_state,
         pytest.raises(AmassError),
     ):
         _execute_task("example.com")
-
-    update_state.assert_called_once_with(
-        state="FAILURE", meta={"error": "amass binary is not installed"}
-    )
 
 
 def test_run_amass_task_rejects_invalid_mode() -> None:

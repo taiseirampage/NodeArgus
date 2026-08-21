@@ -55,5 +55,4 @@ def run_amass_task(
         return _run_async(_run_amass_recon(target, mode))
     except (AmassError, ValueError) as error:
         logger.exception("Amass recon task failed for target %s", target)
-        self.update_state(state="FAILURE", meta={"error": str(error)})
         raise

@@ -76,14 +76,9 @@ def test_run_recon_task_marks_subfinder_failure() -> None:
             new_callable=AsyncMock,
             side_effect=SubfinderError("subfinder binary is not installed"),
         ),
-        patch.object(run_recon_task, "update_state") as update_state,
         pytest.raises(SubfinderError),
     ):
         _execute_task("example.com")
-
-    update_state.assert_called_once_with(
-        state="FAILURE", meta={"error": "subfinder binary is not installed"}
-    )
 
 
 @pytest.mark.asyncio

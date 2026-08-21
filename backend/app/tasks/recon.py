@@ -133,13 +133,16 @@ def run_recon_task(self: Task, target: str) -> dict[str, Any]:
         return _run_async(_run_recon(target))
     except (SubfinderError, ValueError) as error:
         logger.exception("Recon task failed for target %s", target)
-        self.update_state(state="FAILURE", meta={"error": str(error)})
         raise
 
 
 @celery_app.task(name="run_subfinder_collect_task", bind=True)
-def run_subfinder_collect_task(self: Task, target: str) -> list[str]:
-    """Collect raw subdomain names from Subfinder without persisting them."""
+def run_subfinder_collect_task(self: Task, target: str) -> list[str] | dict[str, str]:
+    """Collect raw subdomain names from Subfinder without persisting them.
+
+    Instead of raising, a failed collection returns ``{"error": "..."}`` so the
+    unified recon coordinator can degrade gracefully and keep partial results.
+    """
     try:
         domain = validate_domain(target)
         records = _run_async(run_subfinder(domain))
@@ -150,16 +153,19 @@ def run_subfinder_collect_task(self: Task, target: str) -> list[str]:
                 names.append(host)
         return sorted(names)
     except (SubfinderError, ValueError) as error:
-        logger.exception("Subfinder collection failed for target %s", target)
-        self.update_state(state="FAILURE", meta={"error": str(error)})
-        raise
+        logger.warning("Subfinder collection failed for %s: %s", target, error)
+        return {"error": str(error)}
 
 
 @celery_app.task(name="run_amass_collect_task", bind=True)
 def run_amass_collect_task(
     self: Task, target: str, amass_mode: str = "passive"
 ) -> dict[str, Any]:
-    """Collect raw Amass findings (subdomains, resolved IPs, ASN) without saving."""
+    """Collect Amass findings (subdomains, resolved IPs, ASN) without saving.
+
+    A failed run returns ``{"error": "..."}`` so the unified coordinator can
+    report the tool as failed while still using the other tool's results.
+    """
     from app.scanner.amass_wrapper import AmassError, run_amass
 
     try:
@@ -167,9 +173,28 @@ def run_amass_collect_task(
         mode: Any = amass_mode if amass_mode in ("passive", "active") else "passive"
         return _run_async(run_amass(domain, mode))
     except (AmassError, ValueError) as error:
-        logger.exception("Amass collection failed for target %s", target)
-        self.update_state(state="FAILURE", meta={"error": str(error)})
-        raise
+        logger.warning("Amass collection failed for %s: %s", target, error)
+        return {"error": str(error)}
+
+
+def _recon_progress(
+    task: Task, progress: dict[str, Any], state: str = "PROGRESS"
+) -> None:
+    """Publish per-tool progress, tolerating in-process ``.run()`` execution.
+
+    When a recon task is invoked synchronously from the full-scan pipeline via
+    ``run_unified_recon_task.run(...)``, Celery has not set up a ``Request`` for
+    the nested call, so ``self.request.id`` is ``None`` and ``update_state``
+    would raise a ``ValueError``. This helper skips the write in that case.
+    """
+    try:
+        request_id = task.request.id
+    except Exception:
+        request_id = None
+    if request_id is None:
+        logger.debug("Skipping progress update: task invoked without request id")
+        return
+    task.update_state(state=state, meta={"progress": progress})
 
 
 def _merge_recon_subdomains(
@@ -300,7 +325,6 @@ def run_unified_recon_task(
         domain = validate_domain(target)
     except ValueError as error:
         logger.exception("Unified recon failed for target %s", target)
-        self.update_state(state="FAILURE", meta={"error": str(error)})
         raise
 
     tools = [
@@ -309,7 +333,6 @@ def run_unified_recon_task(
         if tool in _RECON_TOOLS
     ]
     if not tools:
-        self.update_state(state="FAILURE", meta={"error": "no recon tools selected"})
         raise ValueError("recon_tools must include subfinder and/or amass")
 
     signatures = []
@@ -319,10 +342,7 @@ def run_unified_recon_task(
         else:
             signatures.append(run_amass_collect_task.s(domain, amass_mode))
 
-    self.update_state(
-        state="PROGRESS",
-        meta={"progress": {name: "queued" for name in tools}},
-    )
+    _recon_progress(self, {name: "queued" for name in tools})
     workflow = group(signatures)
     group_result = workflow.apply_async()
 
@@ -331,38 +351,63 @@ def run_unified_recon_task(
     while time.time() < deadline:
         progress: dict[str, str] = {}
         for tool, child in zip(tools, children):
-            child_state = child.state
+            try:
+                child_state = child.state
+            except Exception:
+                # A child that somehow reached FAILURE may carry a non-standard
+                # result payload; treat it as failed rather than crashing here.
+                progress[tool] = "failed"
+                continue
             if child_state in ("PENDING", "STARTED", "RETRY"):
                 progress[tool] = "running"
             elif child_state == "SUCCESS":
                 progress[tool] = "success"
             else:
                 progress[tool] = "failed"
-        self.update_state(state="PROGRESS", meta={"progress": progress})
-        if all(child.ready() for child in children):
+        _recon_progress(self, progress)
+        try:
+            all_done = all(child.ready() for child in children)
+        except Exception:
+            all_done = False
+        if all_done:
             break
         time.sleep(1)
 
     subfinder_names: list[str] = []
     amass_result: dict[str, Any] | None = None
+    tool_errors: dict[str, str] = {}
     for tool, child in zip(tools, children):
-        if (
-            tool == "subfinder"
-            and child.state == "SUCCESS"
-            and isinstance(child.result, list)
-        ):
-            subfinder_names = child.result
-        elif (
-            tool == "amass"
-            and child.state == "SUCCESS"
-            and isinstance(child.result, dict)
-        ):
-            amass_result = child.result
+        try:
+            value = child.result
+        except Exception:
+            tool_errors[tool] = f"unexpected failure in {tool}"
+            continue
+        if isinstance(value, dict) and "error" in value:
+            tool_errors[tool] = str(value["error"])
+            continue
+        if tool == "subfinder" and isinstance(value, list):
+            if value and isinstance(value[0], str):
+                subfinder_names = value
+            else:
+                tool_errors[tool] = "subfinder returned an empty result"
+        elif tool == "amass" and isinstance(value, dict):
+            amass_result = value
 
     amass_names = list(amass_result.get("subdomains") or []) if amass_result else []
     merged = _merge_recon_subdomains(subfinder_names, amass_names)
     summary = _run_async(_persist_unified_recon(domain, merged, amass_result))
     summary["tools_used"] = tools
-    summary["status"] = "success"
+    if tool_errors:
+        # Amass may legitimately be disabled (ALLOW_ACTIVE_RECON=false) or a tool
+        # may have failed: keep partial results instead of failing the pipeline.
+        summary["status"] = "partial"
+        summary["tool_errors"] = tool_errors
+        logger.warning(
+            "Unified recon finished with partial results for %s: %s",
+            domain,
+            tool_errors,
+        )
+    else:
+        summary["status"] = "success"
     logger.info("Unified recon finished for %s: %s", domain, summary)
     return summary

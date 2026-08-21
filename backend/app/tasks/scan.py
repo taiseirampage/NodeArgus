@@ -188,7 +188,6 @@ def run_vuln_scan_task(
         )
     except Exception as error:
         logger.exception("Vulnerability scan task failed for target %s", target)
-        self.update_state(state="FAILURE", meta={"error": str(error)})
         raise
 
 
@@ -245,7 +244,6 @@ def run_scan_task(self: Task, target: str) -> dict[str, int | str]:
         }
     except Exception as error:
         logger.exception("Scan task failed for target %s", target)
-        self.update_state(state="FAILURE", meta={"error": str(error)})
         raise
 
 

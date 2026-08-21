@@ -90,11 +90,6 @@ def test_run_full_scan_task_marks_failure_on_error() -> None:
             "app.tasks.pipeline.validate_domain",
             side_effect=ValueError("invalid domain"),
         ),
-        patch.object(run_full_scan_task, "update_state") as update_state,
         pytest.raises(ValueError, match="invalid domain"),
     ):
         run_full_scan_task.run("not a domain")
-
-    update_state.assert_called_once_with(
-        state="FAILURE", meta={"error": "invalid domain"}
-    )
