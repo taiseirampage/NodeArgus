@@ -3,25 +3,37 @@ import type { FormEvent } from 'react'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
+type ScanType = 'active' | 'recon' | 'full'
+
 interface ScanResponse {
   task_id: string
   status: string
+  scan_type: ScanType
 }
 
 interface ScanFormProps {
   onTaskCreated: (taskId: string, targetIp: string) => void
 }
 
+const SCAN_TYPE_OPTIONS: Array<{ value: ScanType; label: string; hint: string }> = [
+  { value: 'active', label: 'Active', hint: 'Nmap + Masscan по IP/CIDR' },
+  { value: 'recon', label: 'Recon', hint: 'Subfinder по домену (пассивно)' },
+  { value: 'full', label: 'Full', hint: 'Recon → активное сканирование IP' },
+]
+
 export function ScanForm({ onTaskCreated }: ScanFormProps) {
   const [target, setTarget] = useState('')
+  const [scanType, setScanType] = useState<ScanType>('active')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const selectedOption = SCAN_TYPE_OPTIONS.find((option) => option.value === scanType)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
     const normalizedTarget = target.trim()
     if (!normalizedTarget) {
-      setError('Укажите IP-адрес или CIDR-подсеть.')
+      setError('Укажите IP-адрес, CIDR-подсеть или домен.')
       return
     }
 
@@ -31,7 +43,7 @@ export function ScanForm({ onTaskCreated }: ScanFormProps) {
       const response = await fetch(`${API_BASE_URL}/scan`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: normalizedTarget }),
+        body: JSON.stringify({ target: normalizedTarget, scan_type: scanType }),
       })
       const payload = (await response.json()) as ScanResponse | { detail?: string }
       if (!response.ok || !('task_id' in payload)) {
@@ -49,7 +61,7 @@ export function ScanForm({ onTaskCreated }: ScanFormProps) {
     <form className="space-y-5" onSubmit={handleSubmit}>
       <div>
         <label className="mb-3 block font-mono text-xs uppercase tracking-[0.16em] text-slate-400" htmlFor="target">
-          IP / CIDR target
+          Target
         </label>
         <div className="group flex items-center rounded-2xl border border-white/10 bg-black/20 px-4 transition focus-within:border-cyan-300/60 focus-within:ring-4 focus-within:ring-cyan-300/10">
           <span className="mr-3 font-mono text-sm text-cyan-300/70">&gt;_</span>
@@ -59,14 +71,46 @@ export function ScanForm({ onTaskCreated }: ScanFormProps) {
             type="text"
             value={target}
             onChange={(event) => setTarget(event.target.value)}
-            placeholder="192.168.1.0/24"
+            placeholder={scanType === 'active' ? '192.168.1.0/24' : 'example.com'}
             autoComplete="off"
             spellCheck={false}
             className="w-full bg-transparent py-4 font-mono text-sm text-white outline-none placeholder:text-slate-700"
             disabled={isSubmitting}
           />
         </div>
-        <p className="mt-3 text-sm text-slate-500">Поддерживаются одиночный IPv4/IPv6, CIDR и списки адресов.</p>
+        {scanType === 'active' ? (
+          <p className="mt-3 text-sm text-slate-500">Поддерживаются одиночный IPv4/IPv6, CIDR и списки адресов.</p>
+        ) : (
+          <p className="mt-3 text-sm text-slate-500">Введите корневой домен для пассивной разведки поддоменов.</p>
+        )}
+      </div>
+
+      <div>
+        <label className="mb-2 block font-mono text-xs uppercase tracking-[0.16em] text-slate-400" htmlFor="scan_type">
+          Режим сканирования
+        </label>
+        <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Режим сканирования">
+          {SCAN_TYPE_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="radio"
+              aria-checked={scanType === option.value}
+              onClick={() => setScanType(option.value)}
+              disabled={isSubmitting}
+              className={`rounded-xl border px-3 py-3 text-left transition ${
+                scanType === option.value
+                  ? 'border-cyan-300/60 bg-cyan-300/10'
+                  : 'border-white/10 bg-black/20 hover:border-white/25'
+              }`}
+            >
+              <span className={`block font-mono text-xs font-semibold ${scanType === option.value ? 'text-cyan-300' : 'text-slate-300'}`}>
+                {option.label}
+              </span>
+              <span className="mt-1 block text-[11px] leading-4 text-slate-500">{option.hint}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
       {error && (
@@ -81,7 +125,7 @@ export function ScanForm({ onTaskCreated }: ScanFormProps) {
         className="flex w-full items-center justify-center gap-3 rounded-2xl bg-cyan-300 px-5 py-4 font-display text-sm font-semibold text-slate-950 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:opacity-50"
       >
         <span className={isSubmitting ? 'animate-spin' : ''}>✦</span>
-        {isSubmitting ? 'Отправка...' : 'Сканировать цель'}
+        {isSubmitting ? 'Отправка...' : selectedOption?.hint ?? 'Сканировать цель'}
       </button>
     </form>
   )

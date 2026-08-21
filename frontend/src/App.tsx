@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react'
 import { ScanForm } from './components/ScanForm'
-import { NetworkGraph } from './components/NetworkGraph'
-import { NodeDetailsPanel } from './components/NodeDetailsPanel'
+import { NetworkGraph, type GraphNode } from './components/NetworkGraph'
+import { NodeDetailsPanel, type SelectedNode } from './components/NodeDetailsPanel'
 import { TaskStatus } from './components/TaskStatus'
 
 const SCANNED_IPS_STORAGE_KEY = 'nodeargus.scannedIps'
@@ -18,19 +18,32 @@ function loadScannedIps(): string[] {
   }
 }
 
+function toSelectedNode(node: GraphNode): SelectedNode {
+  return {
+    id: node.id,
+    node_type: node.node_type,
+    source: node.source ?? null,
+    resolved_ips: node.resolved_ips ?? [],
+    country: node.country ?? null,
+    city: node.city ?? null,
+    os: node.os ?? null,
+    ports_count: node.ports_count ?? 0,
+  }
+}
+
 function App(): ReactElement {
   const [scanTask, setScanTask] = useState<{ id: string; targetIp: string } | null>(null)
   const [scannedIps, setScannedIps] = useState<string[]>(loadScannedIps)
-  const [selectedIp, setSelectedIp] = useState<string | null>(null)
+  const [selectedNode, setSelectedNode] = useState<SelectedNode | null>(null)
   const handleGraphReady = useCallback((targetIp: string): void => {
     setScannedIps((currentIps) => [...currentIps.filter((ip) => ip !== targetIp), targetIp])
   }, [])
-  const handleNodeClick = useCallback((ip: string): void => {
-    setSelectedIp(ip)
+  const handleNodeClick = useCallback((node: GraphNode): void => {
+    setSelectedNode(toSelectedNode(node))
   }, [])
   const clearGraph = useCallback((): void => {
     setScannedIps([])
-    setSelectedIp(null)
+    setSelectedNode(null)
   }, [])
 
   useEffect(() => {
@@ -120,8 +133,8 @@ function App(): ReactElement {
         </footer>
       </div>
       <NodeDetailsPanel
-        ip={selectedIp}
-        onClose={() => setSelectedIp(null)}
+        node={selectedNode}
+        onClose={() => setSelectedNode(null)}
       />
     </main>
   )

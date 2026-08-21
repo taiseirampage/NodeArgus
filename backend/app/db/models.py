@@ -4,14 +4,17 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     CheckConstraint,
+    Column,
     DateTime,
     ForeignKey,
     Integer,
     String,
+    Table,
+    UniqueConstraint,
     false,
     func,
 )
-from sqlalchemy.dialects.postgresql import INET
+from sqlalchemy.dialects.postgresql import UUID, INET
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
@@ -36,6 +39,26 @@ class InetType(TypeDecorator[str]):
 
 class Base(DeclarativeBase):
     """Base class for all SQLAlchemy ORM models."""
+
+
+# Many-to-many bridge between subdomains and IP records. A subdomain can resolve
+# to several IPs and one shared host (e.g. a CDN) can serve many subdomains.
+subdomain_ip_link = Table(
+    "subdomain_ip_link",
+    Base.metadata,
+    Column(
+        "subdomain_id",
+        UUID(as_uuid=True),
+        ForeignKey("subdomains.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "ip_id",
+        Integer,
+        ForeignKey("ips.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
 
 
 class IP(Base):
@@ -75,6 +98,9 @@ class IP(Base):
     )
     vulnerabilities: Mapped[list["Vulnerability"]] = relationship(
         back_populates="ip", cascade="all, delete-orphan"
+    )
+    subdomains: Mapped[list["Subdomain"]] = relationship(
+        secondary=subdomain_ip_link, back_populates="ip_records"
     )
 
 
@@ -138,3 +164,50 @@ class Vulnerability(Base):
     )
 
     ip: Mapped[IP] = relationship(back_populates="vulnerabilities")
+
+
+class Domain(Base):
+    """A registered root domain enumerated by passive recon."""
+
+    __tablename__ = "domains"
+
+    id: Mapped[Any] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(String(253), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    subdomains: Mapped[list["Subdomain"]] = relationship(
+        back_populates="domain", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class Subdomain(Base):
+    """A subdomain discovered for a root domain by a passive source."""
+
+    __tablename__ = "subdomains"
+    __table_args__ = (
+        UniqueConstraint("domain_id", "name", name="uq_subdomain_domain_name"),
+    )
+
+    id: Mapped[Any] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    domain_id: Mapped[Any] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("domains.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(253), nullable=False, index=True)
+    source: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    domain: Mapped[Domain] = relationship(back_populates="subdomains")
+    ip_records: Mapped[list[IP]] = relationship(
+        secondary=subdomain_ip_link, back_populates="subdomains", lazy="selectin"
+    )

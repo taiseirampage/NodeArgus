@@ -1,15 +1,18 @@
 from collections.abc import Iterable
 import ipaddress
 from itertools import combinations
+from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import cast, func, or_, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.db.models import IP, Link, Port
-from app.scanner.validator import validate_target
+from app.db import crud
+from app.db.models import IP, Domain, Link, Port, Subdomain, subdomain_ip_link
+from app.scanner.validator import validate_domain, validate_target
 
 from .models import GraphLink, GraphNode, GraphResponse
 
@@ -260,3 +263,127 @@ async def compute_graph(db: AsyncSession, target_ip: str) -> GraphResponse:
         if source_id in records_by_id and target_id in records_by_id
     )
     return GraphResponse(center_ip=normalized, nodes=nodes, links=links)
+
+
+async def _load_domain_graph_records(
+    db: AsyncSession, domain_id: Any
+) -> list[tuple[Subdomain, list[IP]]]:
+    """Load a domain's subdomains with their resolved IP records."""
+    result = await db.execute(
+        select(Subdomain)
+        .where(Subdomain.domain_id == domain_id)
+        .options(selectinload(Subdomain.ip_records))
+        .order_by(Subdomain.name)
+    )
+    subdomains = result.scalars().all()
+    return [(subdomain, list(subdomain.ip_records)) for subdomain in subdomains]
+
+
+async def compute_domain_graph(db: AsyncSession, domain_name: str) -> GraphResponse:
+    """Compute a graph for a root domain: domain, subdomains, and resolved IPs.
+
+    The returned nodes carry a ``node_type`` so the UI can render domains and
+    subdomains differently from IP addresses. Subdomain-to-IP links are stored
+    in ``subdomain_ip_link`` and surfaced here as ``resolves_to`` relationships.
+
+    Args:
+        db: The active async session.
+        domain_name: The validated root FQDN.
+
+    Returns:
+        A ``GraphResponse`` centered on the domain node.
+
+    Raises:
+        HTTPException: 404 when the domain has not been enumerated.
+    """
+    domain = await crud.get_domain_by_name(db, domain_name)
+    if domain is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Domain not found in database",
+        )
+
+    subdomain_rows = await _load_domain_graph_records(db, domain.id)
+    ip_records_by_id: dict[int, IP] = {}
+    for _, ip_records in subdomain_rows:
+        for record in ip_records:
+            ip_records_by_id[record.id] = record
+
+    port_counts = await _get_port_counts(db, list(ip_records_by_id))
+
+    domain_node = GraphNode(
+        id=domain.name,
+        ip=domain.name,
+        node_type="domain",
+        ports_count=0,
+    )
+    nodes: list[GraphNode] = [domain_node]
+    links: list[GraphLink] = []
+
+    for subdomain, ip_records in subdomain_rows:
+        subdomain_node = GraphNode(
+            id=subdomain.name,
+            ip=subdomain.name,
+            node_type="subdomain",
+            source=subdomain.source,
+            resolved_ips=[str(record.ip_address) for record in ip_records],
+            ports_count=0,
+        )
+        nodes.append(subdomain_node)
+        links.append(
+            GraphLink(
+                source=domain.name,
+                target=subdomain.name,
+                type="subdomain_of",
+            )
+        )
+        for record in ip_records:
+            links.append(
+                GraphLink(
+                    source=subdomain.name,
+                    target=str(record.ip_address),
+                    type="resolves_to",
+                )
+            )
+
+    for record in ip_records_by_id.values():
+        nodes.append(
+            GraphNode(
+                id=str(record.ip_address),
+                ip=str(record.ip_address),
+                node_type="ip",
+                country=record.country,
+                city=record.city,
+                os=record.os,
+                ports_count=port_counts.get(record.id, 0),
+                is_traceroute_hop=record.is_traceroute_hop,
+            )
+        )
+
+    return GraphResponse(center_ip=domain.name, nodes=nodes, links=links)
+
+
+async def compute_graph_for_target(db: AsyncSession, target: str) -> GraphResponse:
+    """Dispatch to the IP or domain graph based on whether the target is a domain.
+
+    Args:
+        db: The active async session.
+        target: A validated IP, CIDR, or fully qualified domain name.
+
+    Returns:
+        The appropriate graph response.
+
+    Raises:
+        HTTPException: 400 when the target is neither a valid IP/CIDR nor FQDN.
+    """
+    try:
+        return await compute_graph(db, validate_target(target))
+    except ValueError:
+        try:
+            domain = validate_domain(target)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="target must be a valid IP, CIDR, or fully qualified domain name",
+            ) from error
+        return await compute_domain_graph(db, domain)

@@ -5,6 +5,10 @@ const POLL_INTERVAL_MS = 3000
 
 interface TaskResult {
   ports_found?: number
+  subdomains?: number
+  subdomains_found?: number
+  ips_to_scan?: number
+  message?: string
   [key: string]: unknown
 }
 
@@ -114,9 +118,16 @@ export function TaskStatus({ taskId, targetIp, onSuccess }: TaskStatusProps) {
 
       {requestError ? (
         <p className="mt-6 rounded-xl border border-rose-300/20 bg-rose-300/5 px-4 py-3 text-sm text-rose-200" role="alert">{requestError}</p>
-      ) : status?.status === 'success' ? (
-        <p className="mt-6 text-lg text-emerald-200">Успешно! Найдено портов: {status.result?.ports_found ?? 0}</p>
-      ) : status?.status === 'failed' ? (
+) : status?.status === 'success' ? (
+        status.result?.subdomains !== undefined || status.result?.subdomains_found !== undefined ? (
+          <p className="mt-6 text-lg text-emerald-200">
+            Успешно! Найдено поддоменов: {status.result?.subdomains ?? status.result?.subdomains_found ?? 0}
+            {status.result?.ips_to_scan !== undefined && ` · активных сканов: ${status.result.ips_to_scan}`}
+          </p>
+        ) : (
+          <p className="mt-6 text-lg text-emerald-200">Успешно! Найдено портов: {status.result?.ports_found ?? 0}</p>
+        )
+    ) : status?.status === 'failed' ? (
         <p className="mt-6 text-sm leading-6 text-rose-200">Ошибка: {status.error ?? 'Неизвестная ошибка'}</p>
       ) : (
         <div className="mt-6 flex items-center gap-3 text-sm text-amber-100">

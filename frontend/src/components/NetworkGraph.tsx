@@ -6,6 +6,9 @@ const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 export interface GraphNode extends d3.SimulationNodeDatum {
   id: string
   ip: string
+  node_type: 'ip' | 'domain' | 'subdomain'
+  source: string | null
+  resolved_ips: string[]
   country: string | null
   city: string | null
   os: string | null
@@ -16,7 +19,7 @@ export interface GraphNode extends d3.SimulationNodeDatum {
 }
 
 export interface GraphLink extends d3.SimulationLinkDatum<GraphNode> {
-  type: 'same_subnet' | 'same_dns' | 'common_port' | 'traceroute_hop' | string
+  type: 'same_subnet' | 'same_dns' | 'common_port' | 'traceroute_hop' | 'subdomain_of' | 'resolves_to' | string
 }
 
 interface GraphData {
@@ -28,7 +31,7 @@ interface GraphData {
 interface NetworkGraphProps {
   allScannedIps: string[]
   latestScannedIp: string | null
-  onNodeClick: (ip: string) => void
+  onNodeClick: (node: GraphNode) => void
 }
 
 type LinkEndpoint = string | number | GraphNode
@@ -40,6 +43,37 @@ function endpointNode(endpoint: LinkEndpoint, nodes: GraphNode[]): GraphNode | u
 
 function endpointId(endpoint: LinkEndpoint): string {
   return typeof endpoint === 'object' ? endpoint.id : String(endpoint)
+}
+
+const NODE_COLORS: Record<GraphNode['node_type'], { fill: string; stroke: string }> = {
+  ip: { fill: '#34d399', stroke: '#a7f3d0' },
+  domain: { fill: '#a78bfa', stroke: '#ddd6fe' },
+  subdomain: { fill: '#60a5fa', stroke: '#bfdbfe' },
+}
+
+function diamondPath(radius: number): string {
+  return `M 0,-${radius} L ${radius},0 L 0,${radius} L -${radius},0 Z`
+}
+
+function hexagonPath(radius: number): string {
+  const points: string[] = []
+  for (let index = 0; index < 6; index += 1) {
+    const angle = (Math.PI / 3) * index - Math.PI / 2
+    points.push(`${radius * Math.cos(angle)},${radius * Math.sin(angle)}`)
+  }
+  return `M ${points.join('L ')} Z`
+}
+
+function nodeShape(node: GraphNode): { d: string | null; radius: number } {
+  if (node.is_traceroute_hop) return { d: null, radius: 5 }
+  if (node.node_type === 'domain') return { d: diamondPath(12), radius: 12 }
+  if (node.node_type === 'subdomain') return { d: hexagonPath(9), radius: 9 }
+  return { d: null, radius: 7 }
+}
+
+function nodeTheme(node: GraphNode): { fill: string; stroke: string } {
+  if (node.is_traceroute_hop) return { fill: '#6b7280', stroke: '#d1d5db' }
+  return NODE_COLORS[node.node_type]
 }
 
 function mergeGraphResponses(graphs: GraphData[], targets: string[]): GraphData {
@@ -150,32 +184,66 @@ export function NetworkGraph({ allScannedIps, latestScannedIp, onNodeClick }: Ne
       .selectAll<SVGLineElement, GraphLink>('line')
       .data(data.links)
       .join('line')
-      .attr('stroke', (link) => (link.type === 'same_subnet' ? '#64748b' : '#22d3ee'))
-      .attr('stroke-width', (link) => (link.type === 'same_subnet' ? 1 : 2))
+      .attr('stroke', (link) => {
+        if (link.type === 'same_subnet') return '#64748b'
+        if (link.type === 'resolves_to') return '#818cf8'
+        if (link.type === 'subdomain_of') return '#38bdf8'
+        return '#22d3ee'
+      })
+      .attr('stroke-width', (link) => (link.type === 'same_subnet' ? 1 : 1.5))
       .attr('stroke-dasharray', (link) => (link.type === 'traceroute_hop' ? '4 4' : null))
 
-    const nodes = nodeLayer
-      .selectAll<SVGCircleElement, GraphNode>('circle')
+    const nodeGroups = nodeLayer
+      .selectAll<SVGGElement, GraphNode>('g.node')
       .data(data.nodes)
-      .join('circle')
-      .attr('r', (node) => (node.is_traceroute_hop ? 5 : node.id === latestScannedIp ? 12 : 7))
-      .attr('fill', (node) => (node.is_traceroute_hop ? '#6b7280' : node.id === latestScannedIp ? '#f97316' : '#34d399'))
-      .attr('stroke', (node) => (node.is_traceroute_hop ? '#d1d5db' : node.id === latestScannedIp ? '#fed7aa' : '#a7f3d0'))
-      .attr('stroke-width', (node) => (node.is_traceroute_hop ? 1 : node.id === latestScannedIp ? 2 : 1))
+      .join('g')
+      .attr('class', 'node')
       .style('cursor', 'grab')
 
-    nodes
-      .append('title')
-      .text((node) => {
-        if (!node.is_traceroute_hop) return node.id
-        const rtt = node.traceroute_rtt
-          ? node.traceroute_rtt.endsWith('ms') ? node.traceroute_rtt : `${node.traceroute_rtt} ms`
-          : 'unknown'
-        return `Router Hop #${node.traceroute_hop ?? '?'} (RTT: ${rtt})`
+    nodeGroups
+      .filter((node) => nodeShape(node).d === null)
+      .selectAll<SVGCircleElement, GraphNode>('circle')
+      .data((node) => [node])
+      .join('circle')
+      .attr('r', (node) => {
+        const { radius } = nodeShape(node)
+        return node.id === latestScannedIp ? Math.max(radius + 5, 12) : radius
       })
 
-    nodes.on('click', (_event, node) => {
-        onNodeClick(node.ip)
+    nodeGroups
+      .filter((node) => nodeShape(node).d !== null)
+      .selectAll<SVGPathElement, GraphNode>('path')
+      .data((node) => [node])
+      .join('path')
+      .attr('d', (node) => nodeShape(node).d ?? '')
+
+    nodeGroups
+      .selectAll<SVGCircleElement | SVGPathElement, GraphNode>('circle, path')
+      .attr('fill', (node) => nodeTheme(node).fill)
+      .attr('stroke', (node) => (node.id === latestScannedIp ? '#fed7aa' : nodeTheme(node).stroke))
+      .attr('stroke-width', (node) => (node.id === latestScannedIp ? 2.5 : 1.5))
+      .style('cursor', 'grab')
+
+    nodeGroups
+      .append('title')
+      .text((node) => {
+        if (node.is_traceroute_hop) {
+          const rtt = node.traceroute_rtt
+            ? node.traceroute_rtt.endsWith('ms') ? node.traceroute_rtt : `${node.traceroute_rtt} ms`
+            : 'unknown'
+          return `Router Hop #${node.traceroute_hop ?? '?'} (RTT: ${rtt})`
+        }
+        if (node.node_type === 'subdomain') {
+          return `${node.id} · source: ${node.source ?? 'unknown'}\nresolves to: ${node.resolved_ips.join(', ') || 'none'}`
+        }
+        if (node.node_type === 'domain') {
+          return node.id
+        }
+        return node.id
+      })
+
+    nodeGroups.on('click', (_event, node) => {
+        onNodeClick(node)
       })
 
     const labels = labelLayer
@@ -214,13 +282,13 @@ export function NetworkGraph({ allScannedIps, latestScannedIp, onNodeClick }: Ne
           .attr('y1', (link) => endpointNode(link.source, data.nodes)?.y ?? 0)
           .attr('x2', (link) => endpointNode(link.target, data.nodes)?.x ?? 0)
           .attr('y2', (link) => endpointNode(link.target, data.nodes)?.y ?? 0)
-        nodes.attr('cx', (node) => node.x ?? 0).attr('cy', (node) => node.y ?? 0)
+        nodeGroups.attr('transform', (node) => `translate(${node.x ?? 0},${node.y ?? 0})`)
         labels.attr('x', (node) => node.x ?? 0).attr('y', (node) => node.y ?? 0)
       })
 
-    nodes.call(
+    nodeGroups.call(
       d3
-        .drag<SVGCircleElement, GraphNode>()
+        .drag<SVGGElement, GraphNode>()
         .on('start', (event, node) => {
           event.sourceEvent.stopPropagation()
           if (!event.active) simulation.alphaTarget(0.3).restart()

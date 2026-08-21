@@ -12,6 +12,16 @@ afterEach(() => {
 
 describe('NodeDetailsPanel request lifecycle', () => {
   it('aborts the previous request when the selected IP changes', async () => {
+    const ipNode = (id: string) => ({
+      id,
+      node_type: 'ip' as const,
+      source: null,
+      resolved_ips: [],
+      country: null,
+      city: null,
+      os: null,
+      ports_count: 0,
+    })
     const signals: AbortSignal[] = []
     const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.signal) signals.push(init.signal)
@@ -20,12 +30,12 @@ describe('NodeDetailsPanel request lifecycle', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const view = render(
-      <NodeDetailsPanel ip="192.168.1.10" onClose={() => undefined} />,
+      <NodeDetailsPanel node={ipNode('192.168.1.10')} onClose={() => undefined} />,
     )
     await waitFor(() => expect(signals).toHaveLength(1))
 
     view.rerender(
-      <NodeDetailsPanel ip="192.168.1.20" onClose={() => undefined} />,
+      <NodeDetailsPanel node={ipNode('192.168.1.20')} onClose={() => undefined} />,
     )
     await waitFor(() => expect(signals).toHaveLength(2))
 
@@ -56,7 +66,19 @@ describe('NodeDetailsPanel request lifecycle', () => {
       }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
-    render(<NodeDetailsPanel ip="192.168.1.10" onClose={() => undefined} />)
+    render(<NodeDetailsPanel
+      node={{
+        id: '192.168.1.10',
+        node_type: 'ip',
+        source: null,
+        resolved_ips: [],
+        country: null,
+        city: null,
+        os: null,
+        ports_count: 0,
+      }}
+      onClose={() => undefined}
+    />)
     await act(async () => {
       await Promise.resolve()
       await Promise.resolve()

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
 
 
@@ -6,6 +8,9 @@ class GraphNode(BaseModel):
 
     id: str
     ip: str
+    node_type: Literal["ip", "domain", "subdomain"] = "ip"
+    source: str | None = None
+    resolved_ips: list[str] = []
     country: str | None = None
     city: str | None = None
     os: str | None = None

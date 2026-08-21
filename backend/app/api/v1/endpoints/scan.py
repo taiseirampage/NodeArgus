@@ -1,14 +1,19 @@
 import logging
 from collections.abc import Mapping
+from typing import Literal
 
 from fastapi import APIRouter, status
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, model_validator
 from celery.result import AsyncResult
 
 from app.celery_worker import celery_app
-from app.tasks import run_scan_task
-from app.scanner.validator import validate_target as validate_scan_target
+from app.tasks import run_recon_task, run_scan_task
+from app.tasks.pipeline import run_full_scan_task
+from app.scanner.validator import (
+    validate_domain,
+    validate_target as validate_scan_target,
+)
 
 
 router = APIRouter()
@@ -17,19 +22,21 @@ logger = logging.getLogger(__name__)
 
 class ScanRequest(BaseModel):
     target: str
+    scan_type: Literal["recon", "active", "full"] = "active"
 
-    @field_validator("target")
-    @classmethod
-    def validate_target(cls, value: str) -> str:
-        try:
-            return validate_scan_target(value)
-        except ValueError as error:
-            raise ValueError(str(error)) from error
+    @model_validator(mode="after")
+    def normalize_target(self) -> "ScanRequest":
+        if self.scan_type in ("recon", "full"):
+            self.target = validate_domain(self.target)
+        else:
+            self.target = validate_scan_target(self.target)
+        return self
 
 
 class ScanResponse(BaseModel):
     task_id: str
     status: str
+    scan_type: Literal["recon", "active", "full"] = "active"
 
 
 class ScanStatusResponse(BaseModel):
@@ -51,8 +58,13 @@ def _result_payload(value: object) -> dict[str, object] | None:
 
 @router.post("/scan", status_code=status.HTTP_202_ACCEPTED, response_model=ScanResponse)
 async def create_scan(request: ScanRequest) -> ScanResponse:
-    task = run_scan_task.delay(request.target)
-    return ScanResponse(task_id=task.id, status="queued")
+    if request.scan_type == "recon":
+        task = run_recon_task.delay(request.target)
+    elif request.scan_type == "full":
+        task = run_full_scan_task.delay(request.target)
+    else:
+        task = run_scan_task.delay(request.target)
+    return ScanResponse(task_id=task.id, status="queued", scan_type=request.scan_type)
 
 
 @router.get("/scan/{task_id}", response_model=ScanStatusResponse)

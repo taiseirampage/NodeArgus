@@ -16,16 +16,16 @@ from app.geo.geoip import GeoIPService
 from app.geo.models import GeoLocation
 from app.scanner.models import NmapResult, NmapService, ScannedPort
 
-from .celery_worker import celery_app
-from .scanner.masscan_wrapper import run_masscan
-from .scanner.nmap_wrapper import run_nmap
-from .scanner.nuclei_wrapper import (
+from app.celery_worker import celery_app
+from app.scanner.masscan_wrapper import run_masscan
+from app.scanner.nmap_wrapper import run_nmap
+from app.scanner.nuclei_wrapper import (
     NucleiResult,
     run_nuclei,
     validate_proxy,
     validate_user_agent,
 )
-from .scanner.validator import validate_target
+from app.scanner.validator import validate_target
 
 
 logger = logging.getLogger(__name__)
@@ -247,3 +247,16 @@ def run_scan_task(self: Task, target: str) -> dict[str, int | str]:
         logger.exception("Scan task failed for target %s", target)
         self.update_state(state="FAILURE", meta={"error": str(error)})
         raise
+
+
+@celery_app.task(name="run_active_scan_task", bind=True)
+def run_active_scan_task(self: Task, target: str) -> dict[str, int | str]:
+    """Active scan entrypoint used by the full-scan pipeline.
+
+    The full-scan pipeline discovers subdomains first and then needs to scan
+    every resolved IP. This task is the unit of work that the ``group`` of the
+    pipeline dispatches in parallel across Celery workers; it reuses the same
+    Masscan + Nmap flow as the standalone ``run_scan_task``.
+    """
+    logger.info("Active scan task started for %s", target)
+    return run_scan_task.run(target)

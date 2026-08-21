@@ -25,7 +25,52 @@ async def test_scan_endpoint_enqueues_task() -> None:
     assert response.model_dump() == {
         "task_id": "celery-task-123",
         "status": "queued",
+        "scan_type": "active",
     }
+
+
+@pytest.mark.asyncio
+async def test_scan_endpoint_dispatches_recon_task() -> None:
+    task = SimpleNamespace(id="recon-task-1")
+    with patch("app.api.v1.endpoints.scan.run_recon_task") as task_proxy:
+        task_proxy.delay.return_value = task
+        response = await create_scan(
+            ScanRequest(target="Example.COM", scan_type="recon")
+        )
+
+    task_proxy.delay.assert_called_once_with("example.com")
+    assert response.model_dump() == {
+        "task_id": "recon-task-1",
+        "status": "queued",
+        "scan_type": "recon",
+    }
+
+
+@pytest.mark.asyncio
+async def test_scan_endpoint_dispatches_full_scan_task() -> None:
+    task = SimpleNamespace(id="full-task-1")
+    with patch("app.api.v1.endpoints.scan.run_full_scan_task") as task_proxy:
+        task_proxy.delay.return_value = task
+        response = await create_scan(
+            ScanRequest(target="hackthebox.com", scan_type="full")
+        )
+
+    task_proxy.delay.assert_called_once_with("hackthebox.com")
+    assert response.model_dump() == {
+        "task_id": "full-task-1",
+        "status": "queued",
+        "scan_type": "full",
+    }
+
+
+def test_scan_request_rejects_injectable_domain_for_recon() -> None:
+    with pytest.raises(ValueError):
+        ScanRequest(target="example.com; rm -rf /", scan_type="recon")
+
+
+def test_scan_request_rejects_injectable_ip_for_active() -> None:
+    with pytest.raises(ValueError):
+        ScanRequest(target="192.168.1.1 && whoami", scan_type="active")
 
 
 @pytest.mark.parametrize(
@@ -76,12 +121,12 @@ def test_run_scan_task_success() -> None:
     geo_service.lookup.return_value = geo
 
     with (
-        patch("app.tasks.validate_target", return_value="8.8.8.8") as validate,
-        patch("app.tasks.run_masscan", return_value=masscan_result) as masscan,
-        patch("app.tasks.run_nmap", return_value=nmap_result) as nmap,
-        patch("app.tasks.GeoIPService", return_value=geo_service) as geo_class,
-        patch("app.tasks._save_scan_result", new_callable=MagicMock) as save,
-        patch("app.tasks._run_async") as run_async,
+        patch("app.tasks.scan.validate_target", return_value="8.8.8.8") as validate,
+        patch("app.tasks.scan.run_masscan", return_value=masscan_result) as masscan,
+        patch("app.tasks.scan.run_nmap", return_value=nmap_result) as nmap,
+        patch("app.tasks.scan.GeoIPService", return_value=geo_service) as geo_class,
+        patch("app.tasks.scan._save_scan_result", new_callable=MagicMock) as save,
+        patch("app.tasks.scan._run_async") as run_async,
     ):
         save.return_value = None
         result = run_scan_task.run("8.8.8.8")
@@ -124,14 +169,14 @@ def test_run_scan_task_persists_each_target_in_a_list() -> None:
 
     with (
         patch(
-            "app.tasks.validate_target",
+            "app.tasks.scan.validate_target",
             return_value="192.168.1.10,192.168.1.20,192.168.1.100",
         ),
-        patch("app.tasks.run_masscan", return_value=masscan_result),
-        patch("app.tasks.run_nmap", return_value=nmap_result) as nmap,
-        patch("app.tasks.GeoIPService", return_value=geo_service),
-        patch("app.tasks._save_scan_result", new_callable=MagicMock) as save,
-        patch("app.tasks._run_async") as run_async,
+        patch("app.tasks.scan.run_masscan", return_value=masscan_result),
+        patch("app.tasks.scan.run_nmap", return_value=nmap_result) as nmap,
+        patch("app.tasks.scan.GeoIPService", return_value=geo_service),
+        patch("app.tasks.scan._save_scan_result", new_callable=MagicMock) as save,
+        patch("app.tasks.scan._run_async") as run_async,
     ):
         result = run_scan_task.run(masscan_result.target)
 
@@ -153,7 +198,7 @@ def test_run_scan_task_persists_each_target_in_a_list() -> None:
 def test_run_scan_task_marks_invalid_target_as_failure() -> None:
     with (
         patch(
-            "app.tasks.validate_target",
+            "app.tasks.scan.validate_target",
             side_effect=ValueError("invalid target"),
         ),
         patch.object(run_scan_task, "update_state") as update_state,

@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -7,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.v1.endpoints.graph import get_graph
 from app.db import crud
-from app.db.models import Base, IP, Link, Port
-from app.graph.compute import compute_graph
+from app.db.models import Base, Domain, IP, Link, Port, Subdomain, subdomain_ip_link
+from app.graph.compute import compute_domain_graph, compute_graph
 
 
 @pytest_asyncio.fixture
@@ -183,3 +184,65 @@ async def test_graph_includes_traceroute_chain_and_hop_metadata(
         "traceroute_hop",
     ]
     assert response.links[-1].target == "203.0.113.10"
+
+
+@pytest.mark.asyncio
+async def test_domain_graph_returns_domain_subdomain_and_ip_nodes(
+    db_session: AsyncSession,
+) -> None:
+    domain = Domain(id=uuid4(), name="example.com")
+    db_session.add(domain)
+    await db_session.flush()
+    subdomain = Subdomain(
+        id=uuid4(), domain_id=domain.id, name="www.example.com", source="crtsh"
+    )
+    ip_record = IP(ip_address="1.2.3.4")
+    db_session.add(ip_record)
+    await db_session.flush()
+    db_session.add(subdomain)
+    await db_session.flush()
+    await db_session.execute(
+        subdomain_ip_link.insert().values(subdomain_id=subdomain.id, ip_id=ip_record.id)
+    )
+    await db_session.commit()
+
+    response = await compute_domain_graph(db_session, "example.com")
+
+    by_id = {node.id: node for node in response.nodes}
+    assert set(by_id) == {"example.com", "www.example.com", "1.2.3.4"}
+    assert by_id["example.com"].node_type == "domain"
+    assert by_id["www.example.com"].node_type == "subdomain"
+    assert by_id["www.example.com"].source == "crtsh"
+    assert by_id["www.example.com"].resolved_ips == ["1.2.3.4"]
+    assert by_id["1.2.3.4"].node_type == "ip"
+
+    link_types = {(link.source, link.target, link.type) for link in response.links}
+    assert ("example.com", "www.example.com", "subdomain_of") in link_types
+    assert ("www.example.com", "1.2.3.4", "resolves_to") in link_types
+
+
+@pytest.mark.asyncio
+async def test_domain_graph_404_for_unknown_domain(db_session: AsyncSession) -> None:
+    with pytest.raises(HTTPException) as error:
+        await compute_domain_graph(db_session, "nonexistent.example")
+
+    assert error.value.status_code == 404
+    assert error.value.detail == "Domain not found in database"
+
+
+@pytest.mark.asyncio
+async def test_graph_dispatcher_handles_domain_and_ip_targets(
+    db_session: AsyncSession,
+) -> None:
+    domain = Domain(id=uuid4(), name="example.com")
+    db_session.add(domain)
+    await db_session.flush()
+    db_session.add(Subdomain(id=uuid4(), domain_id=domain.id, name="a.example.com"))
+    await db_session.commit()
+
+    domain_response = await get_graph("example.com", db_session)
+    assert domain_response.center_ip == "example.com"
+
+    with pytest.raises(HTTPException) as error:
+        await get_graph("not a target!", db_session)
+    assert error.value.status_code == 400

@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
 import ipaddress
 import logging
+from typing import Any
 
 from sqlalchemy import case, delete, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -12,7 +14,7 @@ from app.scanner.models import NmapResult
 
 from app.scanner.nuclei_wrapper import NucleiVulnerability
 
-from .models import IP, Link, Port, Vulnerability
+from .models import IP, Domain, Link, Port, Subdomain, subdomain_ip_link, Vulnerability
 from .schemas import IPCreate, LinkCreate, PortCreate
 
 
@@ -319,3 +321,161 @@ async def save_traceroute_hops(
     finally:
         if geo_service is not None:
             geo_service.close()
+
+
+async def save_recon_results(
+    db: AsyncSession, domain_name: str, subdomains: list[dict[str, object]]
+) -> dict[str, int]:
+    """Persist a root domain, its subdomains, and resolved IP links idempotently.
+
+    Each ``subdomains`` entry is expected to have at least a ``name`` string and
+    may include ``source`` (the passive source that found it) and
+    ``ip_addresses`` (a list of resolved A/AAAA records). Rows are inserted with
+    PostgreSQL ``INSERT ... ON CONFLICT DO NOTHING`` so a re-run never
+    duplicates rows or links.
+
+    Args:
+        db: The active async session.
+        domain_name: The validated root FQDN.
+        subdomains: Discovered subdomain records with optional sources and IPs.
+
+    Returns:
+        A dict summarizing counts of domains, subdomains, and links saved.
+    """
+    domain_id = await _upsert_domain(db, domain_name)
+
+    saved_subdomains = 0
+    saved_links = 0
+    for entry in subdomains:
+        raw_name = entry.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+        name = raw_name.strip().rstrip(".").lower()
+        raw_source = entry.get("source")
+        source = str(raw_source) if isinstance(raw_source, str) else None
+
+        sub_id, created = await _upsert_subdomain(db, domain_id, name, source)
+        if sub_id is None:
+            continue
+        if created:
+            saved_subdomains += 1
+
+        ip_values = entry.get("ip_addresses")
+        if not isinstance(ip_values, list) or not ip_values:
+            continue
+        for raw_ip in ip_values:
+            if not isinstance(raw_ip, str):
+                continue
+            try:
+                ip = str(ipaddress.ip_address(raw_ip))
+            except ValueError:
+                logger.warning("Ignoring invalid resolved IP for %s: %s", name, raw_ip)
+                continue
+            ip_id = await _upsert_ip(db, ip)
+            if await _link_subdomain_ip(db, sub_id, ip_id):
+                saved_links += 1
+
+    await db.commit()
+    logger.info(
+        "Recon saved for %s: %d subdomains, %d links",
+        domain_name,
+        saved_subdomains,
+        saved_links,
+    )
+    return {"domains": 1, "subdomains": saved_subdomains, "links": saved_links}
+
+
+async def _upsert_domain(db: AsyncSession, name: str) -> Any:
+    """Return the id of a domain, inserting the row if it does not exist."""
+    result = await db.execute(
+        pg_insert(Domain)
+        .values(name=name)
+        .on_conflict_do_nothing(index_elements=[Domain.name])
+        .returning(Domain.id)
+    )
+    domain_id = result.scalar_one_or_none()
+    if domain_id is None:
+        existing = await db.execute(select(Domain.id).where(Domain.name == name))
+        domain_id = existing.scalar_one()
+    return domain_id
+
+
+async def _upsert_subdomain(
+    db: AsyncSession, domain_id: Any, name: str, source: str | None
+) -> tuple[Any | None, bool]:
+    """Return ``(subdomain id, created)``, inserting the row when it is new.
+
+    The ``created`` flag is ``True`` only when the row was actually inserted by
+    this call, so callers can count newly discovered subdomains accurately.
+    """
+    result = await db.execute(
+        pg_insert(Subdomain)
+        .values(domain_id=domain_id, name=name, source=source)
+        .on_conflict_do_nothing(index_elements=[Subdomain.domain_id, Subdomain.name])
+        .returning(Subdomain.id)
+    )
+    sub_id = result.scalar_one_or_none()
+    if sub_id is not None:
+        return sub_id, True
+    existing = await db.execute(
+        select(Subdomain.id).where(
+            Subdomain.domain_id == domain_id, Subdomain.name == name
+        )
+    )
+    return existing.scalar_one_or_none(), False
+
+
+async def _upsert_ip(db: AsyncSession, ip: str) -> Any:
+    """Return the id of an IP record, inserting a minimal row when new."""
+    record = await get_ip_by_address(db, ip)
+    if record is not None:
+        return record.id
+    created = IP(ip_address=ip)
+    db.add(created)
+    await db.flush()
+    return created.id
+
+
+async def _link_subdomain_ip(db: AsyncSession, sub_id: Any, ip_id: Any) -> bool:
+    """Link a subdomain to an IP idempotently; return True when newly linked."""
+    result = await db.execute(
+        pg_insert(subdomain_ip_link)
+        .values(subdomain_id=sub_id, ip_id=ip_id)
+        .on_conflict_do_nothing(
+            index_elements=[
+                subdomain_ip_link.c.subdomain_id,
+                subdomain_ip_link.c.ip_id,
+            ]
+        )
+    )
+    return bool(result.rowcount and result.rowcount > 0)
+
+
+async def get_domain_by_name(db: AsyncSession, name: str) -> Domain | None:
+    """Return a root domain record by its validated FQDN."""
+    result = await db.execute(select(Domain).where(Domain.name == name))
+    return result.scalar_one_or_none()
+
+
+async def get_domain_subdomains(db: AsyncSession, domain_id: Any) -> list[Subdomain]:
+    """Return all subdomains belonging to a domain."""
+    result = await db.execute(select(Subdomain).where(Subdomain.domain_id == domain_id))
+    return list(result.scalars().all())
+
+
+async def get_domain_ips(db: AsyncSession, domain_name: str) -> list[str]:
+    """Return the unique IP addresses directly linked to a domain's subdomains.
+
+    One subdomain may resolve to several IPs and a shared host (e.g. a CDN)
+    backends many subdomains, so the join is deduplicated.
+    """
+    statement = (
+        select(IP.ip_address)
+        .join(subdomain_ip_link, subdomain_ip_link.c.ip_id == IP.id)
+        .join(Subdomain, Subdomain.id == subdomain_ip_link.c.subdomain_id)
+        .join(Domain, Domain.id == Subdomain.domain_id)
+        .where(Domain.name == domain_name)
+        .distinct()
+    )
+    result = await db.execute(statement)
+    return [str(row[0]) for row in result.all()]

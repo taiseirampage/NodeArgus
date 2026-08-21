@@ -154,8 +154,8 @@ def test_vulnerability_task_uses_fresh_cache(
         _save_finding(vulnerability_database, ip_id, datetime.now(timezone.utc))
     )
     with (
-        patch("app.tasks.AsyncSessionLocal", vulnerability_database),
-        patch("app.tasks.run_nuclei") as run_nuclei,
+        patch("app.tasks.scan.AsyncSessionLocal", vulnerability_database),
+        patch("app.tasks.scan.run_nuclei") as run_nuclei,
     ):
         result = run_vuln_scan_task.run("192.168.1.10", force=False)
 
@@ -172,9 +172,9 @@ def test_vulnerability_task_force_runs_nuclei(
         _save_finding(vulnerability_database, ip_id, datetime.now(timezone.utc))
     )
     with (
-        patch("app.tasks.AsyncSessionLocal", vulnerability_database),
+        patch("app.tasks.scan.AsyncSessionLocal", vulnerability_database),
         patch(
-            "app.tasks.run_nuclei",
+            "app.tasks.scan.run_nuclei",
             return_value=NucleiResult(target="192.168.1.10"),
         ) as run_nuclei,
     ):
@@ -193,9 +193,9 @@ def test_vulnerability_task_saves_findings(
     ip_id = asyncio.run(_create_ip(vulnerability_database))
     findings = [_finding("critical"), _finding("medium")]
     with (
-        patch("app.tasks.AsyncSessionLocal", vulnerability_database),
+        patch("app.tasks.scan.AsyncSessionLocal", vulnerability_database),
         patch(
-            "app.tasks.run_nuclei",
+            "app.tasks.scan.run_nuclei",
             return_value=NucleiResult(target="192.168.1.10", vulnerabilities=findings),
         ),
     ):

@@ -39,6 +39,17 @@ export interface Vulnerability {
   found_at: string
 }
 
+export interface SelectedNode {
+  id: string
+  node_type: 'ip' | 'domain' | 'subdomain'
+  source: string | null
+  resolved_ips: string[]
+  country: string | null
+  city: string | null
+  os: string | null
+  ports_count: number
+}
+
 interface VulnerabilityScanResponse {
   task_id: string | null
   status: 'queued' | 'processing' | 'success' | 'failed' | 'cached' | 'cancelled'
@@ -52,7 +63,7 @@ interface VulnerabilityQueueResponse {
 }
 
 interface NodeDetailsPanelProps {
-  ip: string | null
+  node: SelectedNode | null
   onClose: () => void
 }
 
@@ -106,7 +117,7 @@ function portStateClass(state: string): string {
   return 'text-gray-400'
 }
 
-export function NodeDetailsPanel({ ip, onClose }: NodeDetailsPanelProps): ReactElement | null {
+export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): ReactElement | null {
   const [details, setDetails] = useState<IpDetails | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -120,6 +131,8 @@ export function NodeDetailsPanel({ ip, onClose }: NodeDetailsPanelProps): ReactE
   const [useStealthMode, setUseStealthMode] = useState<boolean>(false)
   const vulnControllerRef = useRef<AbortController | null>(null)
 
+  const isIpNode = node?.node_type === 'ip'
+
   useEffect(() => {
     vulnControllerRef.current?.abort()
     vulnControllerRef.current = null
@@ -131,14 +144,21 @@ export function NodeDetailsPanel({ ip, onClose }: NodeDetailsPanelProps): ReactE
     setIsCancellingVuln(false)
     setScriptsExpanded(false)
 
-    if (!ip) {
+    if (!node) {
       setDetails(null)
       setLoading(false)
       setError(null)
       return
     }
 
-    const selectedIp = ip
+    if (node.node_type !== 'ip') {
+      setDetails(null)
+      setLoading(false)
+      setError(null)
+      return
+    }
+
+    const selectedIp = node.id
     const controller = new AbortController()
     setDetails(null)
     setLoading(true)
@@ -171,12 +191,12 @@ export function NodeDetailsPanel({ ip, onClose }: NodeDetailsPanelProps): ReactE
       controller.abort()
       vulnControllerRef.current?.abort()
     }
-  }, [ip])
+  }, [node])
 
   async function startVulnerabilityScan(): Promise<void> {
-    if (!ip || isScanningVuln) return
+    if (!node || !isIpNode || isScanningVuln) return
 
-    const selectedIp = ip
+    const selectedIp = node.id
     const controller = new AbortController()
     vulnControllerRef.current?.abort()
     vulnControllerRef.current = controller
@@ -251,9 +271,9 @@ export function NodeDetailsPanel({ ip, onClose }: NodeDetailsPanelProps): ReactE
   }
 
   async function cancelVulnerabilityScan(): Promise<void> {
-    if (!ip || !vulnTaskId || isCancellingVuln) return
+    if (!node || !isIpNode || !vulnTaskId || isCancellingVuln) return
 
-    const selectedIp = ip
+    const selectedIp = node.id
     const selectedTaskId = vulnTaskId
     vulnControllerRef.current?.abort()
     setIsCancellingVuln(true)
@@ -276,14 +296,21 @@ export function NodeDetailsPanel({ ip, onClose }: NodeDetailsPanelProps): ReactE
     }
   }
 
-  if (!ip) return null
+  if (!node) return null
+
+  const nodeLabel = node.node_type === 'domain'
+    ? 'Домен'
+    : node.node_type === 'subdomain'
+      ? 'Поддомен'
+      : 'IP-адрес'
+  const nodeAccent = node.node_type === 'ip' ? 'text-cyan-300' : 'text-violet-300'
 
   return (
     <aside className="fixed right-0 top-0 z-50 h-full w-full overflow-y-auto border-l border-gray-700 bg-gray-800 shadow-2xl transition-transform sm:w-96">
       <div className="sticky top-0 z-10 flex items-start justify-between border-b border-gray-700 bg-gray-800/95 p-5 backdrop-blur">
         <div>
-          <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-cyan-300">Node details</p>
-          <h2 className="mt-2 break-all font-mono text-lg font-semibold text-white">{ip}</h2>
+          <p className={`font-mono text-[10px] uppercase tracking-[0.2em] ${nodeAccent}`}>{nodeLabel}</p>
+          <h2 className="mt-2 break-all font-mono text-lg font-semibold text-white">{node.id}</h2>
         </div>
         <button
           type="button"
@@ -303,7 +330,50 @@ export function NodeDetailsPanel({ ip, onClose }: NodeDetailsPanelProps): ReactE
           </p>
         )}
 
-        {details && (
+        {!isIpNode && node && (
+          <section>
+            <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.18em] text-gray-500">Разведка</p>
+            {node.node_type === 'subdomain' && (
+              <div className="space-y-3 rounded-xl border border-gray-700 bg-gray-900/50 p-4 text-sm">
+                <div className="flex items-start justify-between gap-4">
+                  <span className="text-gray-500">🔍 Источник</span>
+                  <span className="text-right font-mono text-violet-300">{node.source ?? 'неизвестен'}</span>
+                </div>
+                <div className="flex items-start justify-between gap-4">
+                  <span className="text-gray-500">Порты</span>
+                  <span className="text-right font-mono text-cyan-300">{node.ports_count}</span>
+                </div>
+              </div>
+            )}
+            {node.node_type === 'domain' && (
+              <p className="rounded-xl border border-gray-700 bg-gray-900/50 p-4 text-sm leading-6 text-gray-400">
+                Корневой домен. Кликните на поддомены в графе, чтобы увидеть источник discovery и резолвленные IP.
+              </p>
+            )}
+            <p className="mb-3 mt-4 font-mono text-[10px] uppercase tracking-[0.18em] text-gray-500">Резолвленные IP</p>
+            {node.resolved_ips.length === 0 ? (
+              <p className="rounded-xl border border-gray-700 bg-gray-900/50 p-4 text-sm text-gray-400">
+                IP-адреса не резолвлены
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {node.resolved_ips.map((resolvedIp) => (
+                  <li
+                    key={resolvedIp}
+                    className="flex items-center justify-between gap-4 rounded-xl border border-gray-700 bg-gray-900/50 p-3 font-mono text-sm text-cyan-300"
+                  >
+                    <span>{resolvedIp}</span>
+                    <span className="rounded-md bg-cyan-400/10 px-2 py-0.5 font-mono text-[10px] uppercase text-cyan-300">
+                      DNS A
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        )}
+
+        {isIpNode && details && (
           <>
             <section>
               <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.18em] text-gray-500">Geo data</p>
