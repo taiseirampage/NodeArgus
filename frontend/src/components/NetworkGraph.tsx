@@ -6,7 +6,7 @@ const API_BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 export interface GraphNode extends d3.SimulationNodeDatum {
   id: string
   ip: string
-  node_type: 'ip' | 'domain' | 'subdomain'
+  node_type: 'ip' | 'domain' | 'subdomain' | 'asn'
   source: string | null
   resolved_ips: string[]
   country: string | null
@@ -16,10 +16,13 @@ export interface GraphNode extends d3.SimulationNodeDatum {
   is_traceroute_hop: boolean
   traceroute_hop: number | null
   traceroute_rtt: string | null
+  asn_number?: string | null
+  asn_cidr?: string | null
+  asn_org?: string | null
 }
 
 export interface GraphLink extends d3.SimulationLinkDatum<GraphNode> {
-  type: 'same_subnet' | 'same_dns' | 'common_port' | 'traceroute_hop' | 'subdomain_of' | 'resolves_to' | string
+  type: 'same_subnet' | 'same_dns' | 'common_port' | 'traceroute_hop' | 'subdomain_of' | 'resolves_to' | 'asn_of' | string
 }
 
 interface GraphData {
@@ -49,6 +52,22 @@ const NODE_COLORS: Record<GraphNode['node_type'], { fill: string; stroke: string
   ip: { fill: '#34d399', stroke: '#a7f3d0' },
   domain: { fill: '#a78bfa', stroke: '#ddd6fe' },
   subdomain: { fill: '#60a5fa', stroke: '#bfdbfe' },
+  asn: { fill: '#9ca3af', stroke: '#e5e7eb' },
+}
+
+const SUBDOMAIN_SOURCE_COLORS = {
+  both: { fill: '#a855f7', stroke: '#e9d5ff' },
+  subfinder: { fill: '#3b82f6', stroke: '#bfdbfe' },
+  amass: { fill: '#f97316', stroke: '#fed7aa' },
+}
+
+function sourceStyle(source: string | null): { fill: string; stroke: string } {
+  const labels = (source ?? '').split(',').map((label) => label.trim())
+  const hasSubfinder = labels.includes('subfinder') || labels.some((l) => l !== 'amass' && l.length > 0)
+  const hasAmass = labels.includes('amass')
+  if (hasSubfinder && hasAmass) return SUBDOMAIN_SOURCE_COLORS.both
+  if (hasAmass) return SUBDOMAIN_SOURCE_COLORS.amass
+  return SUBDOMAIN_SOURCE_COLORS.subfinder
 }
 
 function diamondPath(radius: number): string {
@@ -64,15 +83,21 @@ function hexagonPath(radius: number): string {
   return `M ${points.join('L ')} Z`
 }
 
-function nodeShape(node: GraphNode): { d: string | null; radius: number } {
+function rectPath(width: number, height: number): string {
+  return `M ${-width / 2},${-height / 2} L ${width / 2},${-height / 2} L ${width / 2},${height / 2} L ${-width / 2},${height / 2} Z`
+}
+
+function nodeShape(node: GraphNode): { d: string | null; radius: number; width?: number; height?: number } {
   if (node.is_traceroute_hop) return { d: null, radius: 5 }
   if (node.node_type === 'domain') return { d: diamondPath(12), radius: 12 }
   if (node.node_type === 'subdomain') return { d: hexagonPath(9), radius: 9 }
+  if (node.node_type === 'asn') return { d: rectPath(56, 22), radius: 12, width: 56, height: 22 }
   return { d: null, radius: 7 }
 }
 
 function nodeTheme(node: GraphNode): { fill: string; stroke: string } {
   if (node.is_traceroute_hop) return { fill: '#6b7280', stroke: '#d1d5db' }
+  if (node.node_type === 'subdomain') return sourceStyle(node.source)
   return NODE_COLORS[node.node_type]
 }
 
@@ -188,10 +213,13 @@ export function NetworkGraph({ allScannedIps, latestScannedIp, onNodeClick }: Ne
         if (link.type === 'same_subnet') return '#64748b'
         if (link.type === 'resolves_to') return '#818cf8'
         if (link.type === 'subdomain_of') return '#38bdf8'
+        if (link.type === 'asn_of') return '#9ca3af'
         return '#22d3ee'
       })
       .attr('stroke-width', (link) => (link.type === 'same_subnet' ? 1 : 1.5))
-      .attr('stroke-dasharray', (link) => (link.type === 'traceroute_hop' ? '4 4' : null))
+      .attr('stroke-dasharray', (link) =>
+        link.type === 'traceroute_hop' || link.type === 'asn_of' ? '4 4' : null,
+      )
 
     const nodeGroups = nodeLayer
       .selectAll<SVGGElement, GraphNode>('g.node')
@@ -233,11 +261,16 @@ export function NetworkGraph({ allScannedIps, latestScannedIp, onNodeClick }: Ne
             : 'unknown'
           return `Router Hop #${node.traceroute_hop ?? '?'} (RTT: ${rtt})`
         }
+        if (node.node_type === 'asn') {
+          return `ASN ${node.asn_number ?? '?'}: ${node.asn_org ?? 'unknown'}\nCIDR: ${node.asn_cidr ?? 'unknown'}`
+        }
         if (node.node_type === 'subdomain') {
           return `${node.id} · source: ${node.source ?? 'unknown'}\nresolves to: ${node.resolved_ips.join(', ') || 'none'}`
         }
         if (node.node_type === 'domain') {
-          return node.id
+          return node.asn_number
+            ? `${node.id}\nAS${node.asn_number} · ${node.asn_org ?? ''}`
+            : node.id
         }
         return node.id
       })

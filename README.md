@@ -51,6 +51,8 @@ flowchart LR
 - Валидация IP, CIDR и списков целей до запуска сканеров.
 - Безопасные Python-обёртки для Masscan, Nmap и Nuclei без shell-конкатенации
   пользовательского ввода.
+- Passive recon субадоменов через Subfinder и расширенная разведка (Subfinder +
+  OWASP Amass): поддомены, ASN, CIDR и инвентаризация инфраструктуры.
 - PostgreSQL `inet` для IP-адресов и вычисление `same_subnet` на лету.
 - GeoIP через локальную MaxMind GeoLite2-City базу.
 - Сохранение сервисов, NSE-результатов, OS detection и traceroute hops.
@@ -301,14 +303,42 @@ Nuclei finding — это сигнал для проверки, а не авто
 
 | Метод | Endpoint | Назначение |
 |---|---|---|
-| `POST` | `/scan` | Поставить сетевое сканирование в очередь |
-| `GET` | `/scan/{task_id}` | Получить статус сетевого сканирования |
+| `POST` | `/scan` | Поставить сканирование в очередь (включая объединённый recon) |
+| `GET` | `/scan/{task_id}/status` | Получить статус и прогресс по инструментам |
+| `GET` | `/scan/{task_id}` | Статус (обратная совместимость) |
 | `GET` | `/ip/{ip}` | Получить детали IP и портов |
 | `GET` | `/graph/{ip}` | Получить узлы и связи графа |
 | `POST` | `/vuln/{ip}` | Поставить Nuclei scan в очередь |
 | `GET` | `/vuln/{ip}/{task_id}` | Получить статус Nuclei scan |
 | `GET` | `/vuln/{ip}/latest` | Получить кэшированные findings |
 | `POST` | `/vuln/{ip}/{task_id}/cancel` | Отменить Nuclei scan |
+
+Пример объединённого recon-запроса:
+
+```bash
+curl -X POST http://localhost:8000/scan \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"example.com","scan_type":"recon","recon_tools":["subfinder","amass"],"amass_mode":"passive"}'
+```
+
+Если `target` — IP/CIDR, `recon_tools` игнорируется (запускается active scan).
+При `scan_type="full"` после recon запускается активное сканирование найденных IP.
+
+## Объединённая разведка (Subfinder + Amass)
+
+`run_unified_recon_task` запускает выбранные инструменты **параллельно** через
+`celery.canvas.group`, затем:
+
+1. Собирает все поддомены из Subfinder и Amass.
+2. Де-дуплицирует по имени (`set`).
+3. Делает DNS-резолвинг каждого уникального поддомена **батчами по 50**.
+4. Сохраняет в БД, объединяя источники: найденный обоими инструментами поддомен
+   получает `source = "crtsh,subfinder,amass"`.
+5. Переносит ASN-атрибуцию Amass в `domains` (`asn`, `cidr`, `org_name`).
+6. Возвращает `{total_subdomains, unique_ips, tools_used, asn_info}`.
+
+Прогресс по каждому инструменту доступен через `GET /scan/{task_id}/status`
+(поле `progress`).
 
 ## Хранение данных
 
@@ -320,6 +350,15 @@ Nuclei finding — это сигнал для проверки, а не авто
   PostgreSQL на лету.
 - Traceroute hops сохраняются как отдельные узлы и связи `traceroute_hop`.
 - Nuclei findings кэшируются на 24 часа, если не указан `force=true`.
+- ASN-атрибуция домена хранится в `domains.asn`/`domains.cidr`/`domains.org_name`,
+  а история ASN — в таблице `asn_info` (per-domain история номеров, CIDR, описаний).
+- Поддомены, найденные и Subfinder, и Amass, де-дуплицируются: `source`
+  расширяется (например, `crtsh,subfinder,amass`) — повторные запуски не создают
+  дубликатов.
+- В графе домен с ASN-атрибуцией отображает узел-прямоугольник `ASN <номер>` и
+  пунктирную серую связь `asn_of`. Поддомены кодируются цветом по источникам:
+  фиолетовый `#a855f7` — оба инструмента, синий `#3b82f6` — только Subfinder,
+  оранжевый `#f97316` — только Amass.
 
 ## GeoIP Setup
 
@@ -340,6 +379,163 @@ python backend/scripts/download_geoip.py --license-key "$GEOIP_LICENSE_KEY"
 
 ```env
 GEOIP_DB_PATH=data/GeoLite2-City.mmdb
+```
+
+## Subfinder (быстрый пассивный recon)
+
+NodeArgus по умолчанию использует **Subfinder v2.15.0** (ProjectDiscovery) для
+быстрого пассивного сбора поддоменов из OSINT-источников. Бинарник ставится в
+Docker-образ и вызывается безопасным враппером
+(`app/scanner/subfinder_wrapper.py`) — без shell, с валидацией домена через
+`validate_domain` и передачей значения одним аргументом `argv`, поэтому
+командная инъекция невозможна.
+
+### Пассивные источники
+
+Конфиг лежит в `/root/.config/subfinder/provider-config.yaml` и включает
+публичные источники без API-ключей: **crtsh, hackertarget, alienvault,
+commoncrawl, waybackarchive**. Для подключения приватных провайдеров (SecurityTrails,
+Virustotal и др.) добавьте ключи в этот файл.
+
+### Пайплайн обработки
+
+1. `run_subfinder(domain)` запускает `subfinder -d <domain> -json -silent`
+   (таймаут 300 секунд) и парсит JSONL построчно.
+2. `run_recon_task` (или `run_subfinder_collect_task` внутри объединённой
+   разведки) собирает найденные имена.
+3. DNS-резолвинг выполняется батчами по 50 с ограничением одновременных
+   запросов (`asyncio.Semaphore(16)`).
+4. Результаты сохраняются идемпотентно (`INSERT ... ON CONFLICT DO NOTHING`),
+   затем используются как цель для активного сканирования или для графа.
+
+### Запуск через API
+
+```bash
+curl -X POST http://localhost:8000/scan \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"example.com","scan_type":"recon","recon_tools":["subfinder"]}'
+```
+
+Статус задачи читается стандартным `GET /scan/<task_id>/status`.
+
+### Ручная проверка внутри контейнера
+
+```bash
+docker compose exec celery_worker subfinder -d example.com -json -silent
+```
+
+Subfinder работает быстро (обычно секунды-минуту) и служит «первым слоем»
+разведки; для глубокого ASN/инфраструктурного анализа поверх него запускается
+Amass.
+
+## OWASP Amass (Deep Recon)
+
+NodeArgus интегрирует **OWASP Amass v4.2.0** для глубокой пассивной и активной
+разведки доменов: расширенный пассивный сбор поддоменов, DNS-брутфорс, ASN и
+CIDR-атрибуция, обратный DNS-поиск и инфраструктурный OSINT. Результаты Amass
+дополняют данные Subfinder: один и тот же поддомен, найденный обоими
+инструментами, хранится один раз, а поле `source` расширяется
+(`crtsh` → `crtsh,amass`).
+
+### Режимы
+
+| Режим | Команда | Назначение |
+|---|---|---|
+| `passive` | `amass enum -passive -d <domain>` | Пассивные data sources, без брутфорса |
+| `active` | `amass enum -d <domain> -brute -w <wordlist>` | Добавляет DNS-брутфорс |
+
+Active-режим требует `ALLOW_ACTIVE_RECON=true` в `.env` — он генерирует заметный
+DNS-шум и затрагивает сторонние резолверы, поэтому по умолчанию выключен.
+
+### Запуск через API
+
+```bash
+curl -X POST http://localhost:8000/scan \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"example.com","scan_type":"amass","amass_mode":"passive"}'
+```
+
+Статус задачи читается стандартным `GET /scan/<task_id>`.
+
+### Почему Amass нужны словари для брутфорса
+
+Пассивные источники находят только уже задокументированные в интернете
+поддомены. DNS-брутфорс перебирает имена из словаря
+(`subdomains-top1mil-5000.txt` — 5000 самых частых префиксов) и проверяет их
+через DNS. Без словаря список проверяемых имён был бы пуст — Amass просто не
+знал бы, какие имена перебирать. Лёгкий словарь ускоряет сканы, большой — даёт
+больше редких имён ценой времени и шума.
+
+### Обновление словаря без пересборки образа
+
+Словарь лежит в `/usr/share/wordlists/amass/` внутри контейнера. Чтобы заменить
+его без пересборки, смонтируйте файл с хоста (volume mount):
+
+```yaml
+# docker-compose.yml, сервис celery_worker:
+volumes:
+  - /path/to/your/subdomains-top1mil-5000.txt:/usr/share/wordlists/amass/subdomains-top1mil-5000.txt
+```
+
+Затем укажите путь переменной `AMASS_WORDLIST_PATH` (по умолчанию уже указывает
+на этот файл). После правки volume достаточно `docker compose up -d celery_worker`.
+
+Пересборка образа с новой версией Amass или словарём:
+
+```bash
+docker compose down
+docker compose build --no-cache celery_worker
+docker compose up -d
+```
+
+Ручная проверка внутри контейнера:
+
+```bash
+docker compose exec celery_worker amass enum -passive -d example.com -config /root/.config/amass/config.yaml -timeout 1
+```
+
+> [!NOTE]
+> В Amass v4.x (в отличие от v3) у подкоманды `intel` нет флагов `-passive` и
+> `-json`, а `enum` выводит найденные связи (FQDN → IPAddress → ASN/CIDR) прямо в
+> stdout. Команда из ранних версий документации
+> `amass intel -d example.com -passive -json` в v4.2.0 завершится ошибкой
+> «flag provided but not defined: -passive». Правильный ручной эквивалент — команда
+> `amass enum` выше; именно её вызывает враппер NodeArgus.
+
+## Почему мерж результатов после DNS-резолвинга эффективнее
+
+Мы сначала де-дуплицируем поддомены (по имени), затем один раз резолвим каждый
+уникальный поддомен. Это дешевле, чем резолвить каждую выдачу инструментов по
+отдельности, потому что **связь «поддомен → IP» — это many-to-many**:
+
+- один поддомен (например, CDN `cdn.example.com`) может резолвиться в несколько
+  IP (`104.20.23.154`, `172.66.147.243`, …);
+- разные поддомены часто резолвятся в **один и тот же** IP (общий хост/LB).
+
+Дедупликация до резолвинга даёт ровно один DNS-запрос на уникальное имя, а
+объединение IP после резолвинга не теряет ни одной связки. Резолв каждого имени
+по батчам из 50 ограничивает веер DNS-запросов (не блокирует сеть и DNS-серверы
+постоянным потоком).
+
+## Активный режим Amass в UI
+
+Active-режим Amass (`-brute` по словарю `subdomains-top1mil-5000.txt`) генерирует
+заметный DNS-шум и может выполняться **10–30 минут**. В интерфейсе это отражено:
+
+- предупреждение в форме (Amass Active);
+- `GET /scan/{task_id}/status` возвращает прогресс по каждому инструменту
+  (`progress: {"subfinder":"success","amass":"running"}`), который TaskStatus
+  отображает как per-tool индикаторы;
+- Active mode требует `ALLOW_ACTIVE_RECON=true` в `.env`.
+
+Команда для тестирования полного пайплайна объединённой разведки:
+
+```bash
+curl -X POST http://localhost:8000/scan \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"example.com","scan_type":"recon","recon_tools":["subfinder","amass"],"amass_mode":"passive"}'
+TASK_ID=<id из ответа>
+curl http://localhost:8000/scan/$TASK_ID/status   # следить за progress
 ```
 
 ## Troubleshooting
@@ -373,6 +569,16 @@ Backend:
 cd backend
 PYTHONPATH=. pytest -q
 ```
+
+DB-ориентированные тесты (`test_recon_db.py`, `test_amass_db.py`) пересоздают
+все таблицы и используют выделенную БД `nodeargus_test`, чтобы не трогать
+prod-данные. Создайте её один раз:
+
+```bash
+docker compose exec postgres psql -U nodeargus -c "CREATE DATABASE nodeargus_test;"
+```
+
+Если БД другая — задайте `POSTGRES_TEST_DATABASE` в `.env`.
 
 Frontend:
 

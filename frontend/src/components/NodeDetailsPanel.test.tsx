@@ -105,3 +105,51 @@ describe('NodeDetailsPanel request lifecycle', () => {
     vi.useRealTimers()
   })
 })
+
+
+describe('NodeDetailsPanel ASN and sources', () => {
+  it('shows ASN information for a domain node', () => {
+    render(
+      <NodeDetailsPanel
+        node={{
+          id: 'example.com',
+          node_type: 'domain',
+          source: null,
+          resolved_ips: [],
+          country: null,
+          city: null,
+          os: null,
+          ports_count: 0,
+          asn_number: '13335',
+          asn_cidr: '104.20.16.0/20',
+          asn_org: 'CLOUDFLARENET',
+        }}
+        onClose={() => undefined}
+      />,
+    )
+
+    expect(screen.getByText('AS13335')).toBeTruthy()
+    expect(screen.getByText('CLOUDFLARENET')).toBeTruthy()
+    expect(screen.getByText('104.20.16.0/20')).toBeTruthy()
+  })
+
+  it('shows the full comma-separated source list for a subdomain', () => {
+    render(
+      <NodeDetailsPanel
+        node={{
+          id: 'www.example.com',
+          node_type: 'subdomain',
+          source: 'crtsh,subfinder,amass',
+          resolved_ips: ['104.20.23.154'],
+          country: null,
+          city: null,
+          os: null,
+          ports_count: 0,
+        }}
+        onClose={() => undefined}
+      />,
+    )
+
+    expect(screen.getByText('crtsh · subfinder · amass')).toBeTruthy()
+  })
+})

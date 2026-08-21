@@ -64,6 +64,9 @@ services:
       GEOIP_LICENSE_KEY: ${GEOIP_LICENSE_KEY:-}
       GEOIP_MIRROR_URL: ${GEOIP_MIRROR_URL:-}
       GEOIP_AUTO_UPDATE: ${GEOIP_AUTO_UPDATE:-false}
+      ALLOW_ACTIVE_RECON: ${ALLOW_ACTIVE_RECON:-false}
+      AMASS_CONF_PATH: ${AMASS_CONF_PATH:-/root/.config/amass/config.yaml}
+      AMASS_WORDLIST_PATH: ${AMASS_WORDLIST_PATH:-/usr/share/wordlists/amass/subdomains-top1mil-5000.txt}
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,6 +107,9 @@ services:
       GEOIP_LICENSE_KEY: ${GEOIP_LICENSE_KEY:-}
       GEOIP_MIRROR_URL: ${GEOIP_MIRROR_URL:-}
       GEOIP_AUTO_UPDATE: ${GEOIP_AUTO_UPDATE:-false}
+      ALLOW_ACTIVE_RECON: ${ALLOW_ACTIVE_RECON:-false}
+      AMASS_CONF_PATH: ${AMASS_CONF_PATH:-/root/.config/amass/config.yaml}
+      AMASS_WORDLIST_PATH: ${AMASS_WORDLIST_PATH:-/usr/share/wordlists/amass/subdomains-top1mil-5000.txt}
     depends_on:
       postgres:
         condition: service_healthy

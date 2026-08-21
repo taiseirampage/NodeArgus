@@ -7,6 +7,9 @@ interface TaskResult {
   ports_found?: number
   subdomains?: number
   subdomains_found?: number
+  total_subdomains?: number
+  unique_ips?: number
+  tools_used?: string[]
   ips_to_scan?: number
   message?: string
   [key: string]: unknown
@@ -17,6 +20,7 @@ interface ScanStatusResponse {
   status: string
   result: TaskResult | null
   error: string | null
+  progress: Record<string, unknown> | null
 }
 
 interface TaskStatusProps {
@@ -47,7 +51,7 @@ export function TaskStatus({ taskId, targetIp, onSuccess }: TaskStatusProps) {
 
     const pollStatus = async (): Promise<void> => {
       try {
-        const response = await fetch(`${API_BASE_URL}/scan/${encodeURIComponent(taskId)}`)
+        const response = await fetch(`${API_BASE_URL}/scan/${encodeURIComponent(taskId)}/status`)
         if (!response.ok) {
           throw new Error(`Ошибка статуса: HTTP ${response.status}`)
         }
@@ -119,20 +123,61 @@ export function TaskStatus({ taskId, targetIp, onSuccess }: TaskStatusProps) {
       {requestError ? (
         <p className="mt-6 rounded-xl border border-rose-300/20 bg-rose-300/5 px-4 py-3 text-sm text-rose-200" role="alert">{requestError}</p>
 ) : status?.status === 'success' ? (
-        status.result?.subdomains !== undefined || status.result?.subdomains_found !== undefined ? (
-          <p className="mt-6 text-lg text-emerald-200">
-            Успешно! Найдено поддоменов: {status.result?.subdomains ?? status.result?.subdomains_found ?? 0}
-            {status.result?.ips_to_scan !== undefined && ` · активных сканов: ${status.result.ips_to_scan}`}
-          </p>
+        status.result?.total_subdomains !== undefined || status.result?.subdomains !== undefined || status.result?.subdomains_found !== undefined ? (
+          <div className="mt-6 space-y-2">
+            <p className="text-lg text-emerald-200">
+              Успешно! Найдено поддоменов: {status.result?.total_subdomains ?? status.result?.subdomains ?? status.result?.subdomains_found ?? 0}
+            </p>
+            {(status.result?.unique_ips !== undefined || status.result?.tools_used !== undefined) && (
+              <div className="rounded-xl border border-gray-700 bg-gray-900/50 p-3 font-mono text-xs leading-5 text-gray-300">
+                {status.result?.unique_ips !== undefined && (
+                  <p>unique IP: <span className="text-cyan-300">{status.result.unique_ips}</span></p>
+                )}
+                {Array.isArray(status.result.tools_used) && status.result.tools_used.length > 0 && (
+                  <p className="mt-1">
+                    tools: {status.result.tools_used.map((tool) => (
+                      <span key={tool} className="ml-1 rounded-md bg-violet-400/10 px-2 py-0.5 uppercase text-violet-300">{tool}</span>
+                    ))}
+                  </p>
+                )}
+              </div>
+            )}
+            {status.result?.ips_to_scan !== undefined && (
+              <p className="text-sm text-emerald-200">Активных сканов: {status.result.ips_to_scan}</p>
+            )}
+          </div>
         ) : (
           <p className="mt-6 text-lg text-emerald-200">Успешно! Найдено портов: {status.result?.ports_found ?? 0}</p>
         )
     ) : status?.status === 'failed' ? (
         <p className="mt-6 text-sm leading-6 text-rose-200">Ошибка: {status.error ?? 'Неизвестная ошибка'}</p>
       ) : (
-        <div className="mt-6 flex items-center gap-3 text-sm text-amber-100">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
-          {statusLabel}
+        <div className="mt-6 space-y-3">
+          <div className="flex items-center gap-3 text-sm text-amber-100">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
+            {statusLabel}
+          </div>
+          {status?.progress && Object.keys(status.progress).length > 0 && (
+            <ul className="space-y-2 rounded-xl border border-gray-700 bg-black/20 p-3">
+              {Object.entries(status.progress).map(([tool, state]) => (
+                <li key={tool} className="flex items-center justify-between gap-3 text-xs">
+                  <span className="font-mono uppercase tracking-wider text-gray-400">{tool}</span>
+                  <span className={`flex items-center gap-2 font-mono ${
+                    state === 'success'
+                      ? 'text-emerald-300'
+                      : state === 'failed'
+                        ? 'text-rose-300'
+                        : 'text-amber-200'
+                  }`}>
+                    {state !== 'success' && state !== 'failed' && (
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-300" />
+                    )}
+                    {String(state)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 

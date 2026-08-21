@@ -14,7 +14,16 @@ from app.scanner.models import NmapResult
 
 from app.scanner.nuclei_wrapper import NucleiVulnerability
 
-from .models import IP, Domain, Link, Port, Subdomain, subdomain_ip_link, Vulnerability
+from .models import (
+    ASNInfo,
+    IP,
+    Domain,
+    Link,
+    Port,
+    Subdomain,
+    subdomain_ip_link,
+    Vulnerability,
+)
 from .schemas import IPCreate, LinkCreate, PortCreate
 
 
@@ -479,3 +488,276 @@ async def get_domain_ips(db: AsyncSession, domain_name: str) -> list[str]:
     )
     result = await db.execute(statement)
     return [str(row[0]) for row in result.all()]
+
+
+def _merge_source(existing: str | None, new: str) -> str:
+    """Return a comma-separated de-duplicated merge of two source labels."""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for raw in (existing or "").split(",") + new.split(","):
+        label = raw.strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        parts.append(label)
+    return ",".join(parts)
+
+
+async def _upsert_subdomain_with_source(
+    db: AsyncSession,
+    domain_id: Any,
+    name: str,
+    source: str,
+) -> tuple[Any | None, bool]:
+    """Upsert a subdomain, merging ``source`` labels into the stored value.
+
+    The same subdomain is often discovered by several tools (Subfinder's passive
+    sources and Amass). This merges the requested labels into the stored
+    ``source`` column instead of overwriting it, so provenance is preserved
+    (e.g. ``crtsh,amass``). Returns ``(subdomain id, created)``.
+    """
+    insert = (
+        pg_insert(Subdomain)
+        .values(domain_id=domain_id, name=name, source=source)
+        .on_conflict_do_nothing(index_elements=[Subdomain.domain_id, Subdomain.name])
+        .returning(Subdomain.id)
+    )
+    result = await db.execute(insert)
+    sub_id = result.scalar_one_or_none()
+    if sub_id is not None:
+        return sub_id, True
+
+    existing = await db.execute(
+        select(Subdomain).where(
+            Subdomain.domain_id == domain_id, Subdomain.name == name
+        )
+    )
+    subdomain = existing.scalar_one_or_none()
+    if subdomain is None:
+        return None, False
+    seen = {
+        label.strip() for label in (subdomain.source or "").split(",") if label.strip()
+    }
+    missing = [label for label in source.split(",") if label not in seen]
+    if missing:
+        subdomain.source = _merge_source(subdomain.source, ",".join(missing))
+        await db.flush()
+    return subdomain.id, False
+
+
+async def _upsert_asn_info(
+    db: AsyncSession, domain_id: Any, asn_entry: dict[str, object]
+) -> bool:
+    """Insert an ASN record idempotently; return True when newly inserted."""
+    asn_number = asn_entry.get("asn_number")
+    if not isinstance(asn_number, int):
+        return False
+    result = await db.execute(
+        pg_insert(ASNInfo)
+        .values(
+            domain_id=domain_id,
+            asn_number=asn_number,
+            cidr=asn_entry.get("cidr"),
+            description=asn_entry.get("description"),
+            country=asn_entry.get("country"),
+        )
+        .on_conflict_do_nothing(index_elements=[ASNInfo.domain_id, ASNInfo.asn_number])
+    )
+    return bool(result.rowcount and result.rowcount > 0)
+
+
+async def save_amass_results(
+    db: AsyncSession,
+    domain_name: str,
+    amass_result: dict[str, Any],
+) -> dict[str, int]:
+    """Persist Amass recon output (subdomains, IPs, ASN) idempotently.
+
+    Subdomains are upserted with source merge so rows already created by
+    Subfinder are updated to also list ``amass`` rather than being replaced.
+    Domain-level ASN/CIDR attribution and per-ASN history rows are stored in the
+    ``domains`` and ``asn_info`` tables respectively.
+
+    Args:
+        db: The active async session.
+        domain_name: The validated root FQDN.
+        amass_result: Output of ``run_amass`` with ``subdomains``, ``asn_info``
+            and ``ip_addresses`` keys.
+
+    Returns:
+        A dict summarizing the number of subdomains, IP links, and ASN records
+        saved.
+    """
+    domain_id = await _upsert_domain(db, domain_name)
+
+    raw_resolved = amass_result.get("resolved")
+    raw_asns = amass_result.get("asn_info")
+    resolved_map: dict[str, list[str]] = (
+        {
+            str(name): [item for item in ips if isinstance(item, str)]
+            for name, ips in raw_resolved.items()
+            if isinstance(name, str) and isinstance(ips, list)
+        }
+        if isinstance(raw_resolved, dict)
+        else {}
+    )
+    asn_entries: list[dict[str, Any]] = [
+        item
+        for item in (raw_asns if isinstance(raw_asns, list) else [])
+        if isinstance(item, dict)
+    ]
+
+    saved_links = 0
+    for name, resolved_ips in resolved_map.items():
+        sub_id, _ = await _upsert_subdomain_with_source(
+            db, domain_id, name.strip().rstrip(".").lower(), "amass"
+        )
+        if sub_id is None:
+            continue
+        for raw_ip in resolved_ips:
+            try:
+                ip = str(ipaddress.ip_address(raw_ip))
+            except ValueError:
+                logger.warning("Ignoring invalid Amass IP: %s", raw_ip)
+                continue
+            ip_id = await _upsert_ip(db, ip)
+            if await _link_subdomain_ip(db, sub_id, ip_id):
+                saved_links += 1
+
+    saved_asn = 0
+    for entry in asn_entries:
+        if await _upsert_asn_info(db, domain_id, entry):
+            saved_asn += 1
+
+    await db.commit()
+    logger.info(
+        "Amass results saved for %s: %d IP links, %d ASN records",
+        domain_name,
+        saved_links,
+        saved_asn,
+    )
+    return {
+        "subdomains": len(resolved_map),
+        "ip_links": saved_links,
+        "asn_records": saved_asn,
+    }
+
+
+async def _apply_domain_asn(
+    db: AsyncSession, domain_id: Any, asn_info: list[dict[str, Any]]
+) -> int:
+    """Persist ASN attribution for a domain and return the number of new rows.
+
+    Stores the best-known ASN/CIDR/organisation on the root ``Domain`` row and
+    keeps a per-ASN history row in ``asn_info`` for graph visualisation.
+    """
+    saved_asn = 0
+    for entry in asn_info:
+        if await _upsert_asn_info(db, domain_id, entry):
+            saved_asn += 1
+
+    primary = next(
+        (
+            entry
+            for entry in asn_info
+            if isinstance(entry.get("asn_number"), int) and entry.get("asn_number")
+        ),
+        None,
+    )
+    if primary is None:
+        return saved_asn
+
+    domain = await db.get(Domain, domain_id)
+    if domain is None:
+        return saved_asn
+    asn_number = int(primary["asn_number"])
+    if domain.asn is None:
+        domain.asn = str(asn_number)
+    if domain.cidr is None and isinstance(primary.get("cidr"), str):
+        domain.cidr = primary["cidr"]
+    if domain.org_name is None and isinstance(primary.get("description"), str):
+        domain.org_name = primary["description"]
+    return saved_asn
+
+
+async def save_unified_recon_results(
+    db: AsyncSession,
+    domain_name: str,
+    subdomains: list[dict[str, Any]],
+    asn_info: list[dict[str, Any]] | None = None,
+) -> dict[str, int]:
+    """Persist de-duplicated multi-tool recon output in one pass.
+
+    The merge coordinator passes a list of unique subdomain records, each with
+    ``name``, a list of ``sources`` (tool labels, e.g. ``["subfinder","amass"]``)
+    and ``ip_addresses``. Subdomains already present from an earlier Subfinder or
+    Amass run are updated to merge the new source labels, so no duplicates are
+    ever created and shared discoveries keep all provenance.
+
+    Args:
+        db: The active async session.
+        domain_name: The validated root FQDN.
+        subdomains: Unique subdomain records with merged source labels.
+        asn_info: Optional ASN attribution records to merge onto the domain.
+
+    Returns:
+        A dict with counts of subdomains, IP links, and ASN records saved.
+    """
+    domain_id = await _upsert_domain(db, domain_name)
+
+    saved_subdomains = 0
+    saved_links = 0
+    for entry in subdomains:
+        raw_name = entry.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+        name = raw_name.strip().rstrip(".").lower()
+        raw_sources = entry.get("sources")
+        sources = (
+            [str(label) for label in raw_sources if isinstance(label, str)]
+            if isinstance(raw_sources, list)
+            else []
+        )
+        if not sources:
+            sources = ["subfinder"]
+
+        sub_id, created = await _upsert_subdomain_with_source(
+            db, domain_id, name, ",".join(sources)
+        )
+        if sub_id is None:
+            continue
+        if created:
+            saved_subdomains += 1
+
+        ip_values = entry.get("ip_addresses")
+        if not isinstance(ip_values, list) or not ip_values:
+            continue
+        for raw_ip in ip_values:
+            if not isinstance(raw_ip, str):
+                continue
+            try:
+                ip = str(ipaddress.ip_address(raw_ip))
+            except ValueError:
+                logger.warning("Ignoring invalid resolved IP for %s: %s", name, raw_ip)
+                continue
+            ip_id = await _upsert_ip(db, ip)
+            if await _link_subdomain_ip(db, sub_id, ip_id):
+                saved_links += 1
+
+    saved_asn = 0
+    if asn_info:
+        saved_asn = await _apply_domain_asn(db, domain_id, asn_info)
+
+    await db.commit()
+    logger.info(
+        "Unified recon saved for %s: %d subdomains, %d links, %d ASNs",
+        domain_name,
+        saved_subdomains,
+        saved_links,
+        saved_asn,
+    )
+    return {
+        "subdomains": saved_subdomains,
+        "ip_links": saved_links,
+        "asn_records": saved_asn,
+    }

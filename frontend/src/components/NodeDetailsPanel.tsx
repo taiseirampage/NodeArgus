@@ -41,13 +41,16 @@ export interface Vulnerability {
 
 export interface SelectedNode {
   id: string
-  node_type: 'ip' | 'domain' | 'subdomain'
+  node_type: 'ip' | 'domain' | 'subdomain' | 'asn'
   source: string | null
   resolved_ips: string[]
   country: string | null
   city: string | null
   os: string | null
   ports_count: number
+  asn_number?: string | null
+  asn_cidr?: string | null
+  asn_org?: string | null
 }
 
 interface VulnerabilityScanResponse {
@@ -337,7 +340,9 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
               <div className="space-y-3 rounded-xl border border-gray-700 bg-gray-900/50 p-4 text-sm">
                 <div className="flex items-start justify-between gap-4">
                   <span className="text-gray-500">🔍 Источник</span>
-                  <span className="text-right font-mono text-violet-300">{node.source ?? 'неизвестен'}</span>
+                  <span className="text-right font-mono text-violet-300">
+                    {(node.source ?? 'неизвестен').split(',').filter(Boolean).join(' · ')}
+                  </span>
                 </div>
                 <div className="flex items-start justify-between gap-4">
                   <span className="text-gray-500">Порты</span>
@@ -346,9 +351,33 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
               </div>
             )}
             {node.node_type === 'domain' && (
-              <p className="rounded-xl border border-gray-700 bg-gray-900/50 p-4 text-sm leading-6 text-gray-400">
-                Корневой домен. Кликните на поддомены в графе, чтобы увидеть источник discovery и резолвленные IP.
-              </p>
+              <div className="space-y-3 rounded-xl border border-gray-700 bg-gray-900/50 p-4 text-sm">
+                {node.asn_number ? (
+                  <>
+                    <div className="flex items-start justify-between gap-4">
+                      <span className="text-gray-500">ASN</span>
+                      <span className="text-right font-mono text-emerald-300">AS{node.asn_number}</span>
+                    </div>
+                    {node.asn_org && (
+                      <div className="flex items-start justify-between gap-4">
+                        <span className="text-gray-500">Организация</span>
+                        <span className="max-w-[12rem] text-right font-mono text-emerald-200">{node.asn_org}</span>
+                      </div>
+                    )}
+                    {node.asn_cidr && (
+                      <div className="flex items-start justify-between gap-4">
+                        <span className="text-gray-500">CIDR</span>
+                        <span className="max-w-[12rem] break-all text-right font-mono text-emerald-200">{node.asn_cidr}</span>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p className="leading-6 text-gray-400">
+                    Корневой домен. Кликните на поддомены в графе, чтобы увидеть источник discovery и резолвленные IP.
+                    ASN-информация появится после объединённой разведки с Amass.
+                  </p>
+                )}
+              </div>
             )}
             <p className="mb-3 mt-4 font-mono text-[10px] uppercase tracking-[0.18em] text-gray-500">Резолвленные IP</p>
             {node.resolved_ips.length === 0 ? (

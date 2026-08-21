@@ -4,11 +4,11 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from app.api.v1.endpoints.scan import (
-    ScanRequest,
     celery_app,
     create_scan,
     get_scan_status,
 )
+from app.schemas.scan import ScanRequest
 from app.geo.models import GeoLocation
 from app.scanner.models import MasscanResult, NmapResult, ScannedPort
 from app.tasks import _run_async, run_scan_task
@@ -26,24 +26,46 @@ async def test_scan_endpoint_enqueues_task() -> None:
         "task_id": "celery-task-123",
         "status": "queued",
         "scan_type": "active",
+        "recon_tools": [],
     }
 
 
 @pytest.mark.asyncio
 async def test_scan_endpoint_dispatches_recon_task() -> None:
     task = SimpleNamespace(id="recon-task-1")
-    with patch("app.api.v1.endpoints.scan.run_recon_task") as task_proxy:
+    with patch("app.api.v1.endpoints.scan.run_unified_recon_task") as task_proxy:
         task_proxy.delay.return_value = task
         response = await create_scan(
             ScanRequest(target="Example.COM", scan_type="recon")
         )
 
-    task_proxy.delay.assert_called_once_with("example.com")
+    task_proxy.delay.assert_called_once_with("example.com", ["subfinder"], "passive")
     assert response.model_dump() == {
         "task_id": "recon-task-1",
         "status": "queued",
         "scan_type": "recon",
+        "recon_tools": ["subfinder"],
     }
+
+
+@pytest.mark.asyncio
+async def test_scan_endpoint_dispatches_unified_recon_with_tools() -> None:
+    task = SimpleNamespace(id="unified-task-1")
+    with patch("app.api.v1.endpoints.scan.run_unified_recon_task") as task_proxy:
+        task_proxy.delay.return_value = task
+        response = await create_scan(
+            ScanRequest(
+                target="Example.COM",
+                scan_type="recon",
+                recon_tools=["subfinder", "amass"],
+                amass_mode="active",
+            )
+        )
+
+    task_proxy.delay.assert_called_once_with(
+        "example.com", ["subfinder", "amass"], "active"
+    )
+    assert response.model_dump()["task_id"] == "unified-task-1"
 
 
 @pytest.mark.asyncio
@@ -52,14 +74,39 @@ async def test_scan_endpoint_dispatches_full_scan_task() -> None:
     with patch("app.api.v1.endpoints.scan.run_full_scan_task") as task_proxy:
         task_proxy.delay.return_value = task
         response = await create_scan(
-            ScanRequest(target="hackthebox.com", scan_type="full")
+            ScanRequest(
+                target="hackthebox.com",
+                scan_type="full",
+                recon_tools=["subfinder", "amass"],
+            )
         )
 
-    task_proxy.delay.assert_called_once_with("hackthebox.com")
+    task_proxy.delay.assert_called_once_with(
+        "hackthebox.com", ["subfinder", "amass"], "passive"
+    )
     assert response.model_dump() == {
         "task_id": "full-task-1",
         "status": "queued",
         "scan_type": "full",
+        "recon_tools": ["subfinder", "amass"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_scan_endpoint_dispatches_amass_task() -> None:
+    task = SimpleNamespace(id="amass-task-1")
+    with patch("app.api.v1.endpoints.scan.run_amass_task") as task_proxy:
+        task_proxy.delay.return_value = task
+        response = await create_scan(
+            ScanRequest(target="Example.COM", scan_type="amass", amass_mode="active")
+        )
+
+    task_proxy.delay.assert_called_once_with("example.com", "active")
+    assert response.model_dump() == {
+        "task_id": "amass-task-1",
+        "status": "queued",
+        "scan_type": "amass",
+        "recon_tools": ["amass"],
     }
 
 
@@ -104,6 +151,22 @@ def test_get_scan_status(
         assert response.error == info
     else:
         assert response.error is None
+
+
+def test_get_scan_status_reports_recon_progress() -> None:
+    task = MagicMock(
+        state="STARTED",
+        result=None,
+        info={"progress": {"subfinder": "running", "amass": "queued"}},
+    )
+    with patch(
+        "app.api.v1.endpoints.scan.AsyncResult", return_value=task
+    ) as result_class:
+        response = get_scan_status("celery-task-123")
+
+    result_class.assert_called_once_with("celery-task-123", app=celery_app)
+    assert response.status == "started"
+    assert response.progress == {"subfinder": "running", "amass": "queued"}
 
 
 def test_run_scan_task_success() -> None:

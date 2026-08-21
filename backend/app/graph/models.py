@@ -8,7 +8,7 @@ class GraphNode(BaseModel):
 
     id: str
     ip: str
-    node_type: Literal["ip", "domain", "subdomain"] = "ip"
+    node_type: Literal["ip", "domain", "subdomain", "asn"] = "ip"
     source: str | None = None
     resolved_ips: list[str] = []
     country: str | None = None
@@ -18,6 +18,9 @@ class GraphNode(BaseModel):
     is_traceroute_hop: bool = False
     traceroute_hop: int | None = None
     traceroute_rtt: str | None = None
+    asn_number: str | None = None
+    asn_cidr: str | None = None
+    asn_org: str | None = None
 
 
 class GraphLink(BaseModel):

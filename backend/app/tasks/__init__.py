@@ -19,7 +19,8 @@ from app.tasks.scan import (
     validate_target,
 )
 
-from app.tasks.recon import run_recon_task
+from app.tasks.recon import run_recon_task, run_unified_recon_task
+from app.tasks.amass_recon import run_amass_task
 from app.tasks.pipeline import run_full_scan_task
 
 __all__ = [
@@ -34,5 +35,7 @@ __all__ = [
     "run_vuln_scan_task",
     "validate_target",
     "run_recon_task",
+    "run_unified_recon_task",
+    "run_amass_task",
     "run_full_scan_task",
 ]

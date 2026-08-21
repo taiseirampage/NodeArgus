@@ -2,9 +2,10 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import time
 from typing import Any
 
-from celery import Task
+from celery import Task, group
 
 from app.celery_worker import celery_app
 from app.db import crud
@@ -18,6 +19,7 @@ from app.tasks.scan import _run_async
 logger = logging.getLogger(__name__)
 
 _RESOLVE_CONCURRENCY = 16
+_RECON_TOOLS = ("subfinder", "amass")
 
 
 def _record_fields(record: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -133,3 +135,234 @@ def run_recon_task(self: Task, target: str) -> dict[str, Any]:
         logger.exception("Recon task failed for target %s", target)
         self.update_state(state="FAILURE", meta={"error": str(error)})
         raise
+
+
+@celery_app.task(name="run_subfinder_collect_task", bind=True)
+def run_subfinder_collect_task(self: Task, target: str) -> list[str]:
+    """Collect raw subdomain names from Subfinder without persisting them."""
+    try:
+        domain = validate_domain(target)
+        records = _run_async(run_subfinder(domain))
+        names: list[str] = []
+        for record in records:
+            host, _ = _record_fields(record)
+            if host:
+                names.append(host)
+        return sorted(names)
+    except (SubfinderError, ValueError) as error:
+        logger.exception("Subfinder collection failed for target %s", target)
+        self.update_state(state="FAILURE", meta={"error": str(error)})
+        raise
+
+
+@celery_app.task(name="run_amass_collect_task", bind=True)
+def run_amass_collect_task(
+    self: Task, target: str, amass_mode: str = "passive"
+) -> dict[str, Any]:
+    """Collect raw Amass findings (subdomains, resolved IPs, ASN) without saving."""
+    from app.scanner.amass_wrapper import AmassError, run_amass
+
+    try:
+        domain = validate_domain(target)
+        mode: Any = amass_mode if amass_mode in ("passive", "active") else "passive"
+        return _run_async(run_amass(domain, mode))
+    except (AmassError, ValueError) as error:
+        logger.exception("Amass collection failed for target %s", target)
+        self.update_state(state="FAILURE", meta={"error": str(error)})
+        raise
+
+
+def _merge_recon_subdomains(
+    subfinder_names: list[str], amass_names: list[str]
+) -> list[dict[str, Any]]:
+    """Merge Subfinder and Amass findings into one deduplicated record list.
+
+    The same subdomain is frequently returned by both tools. We keep a single
+    record per unique name and record which tools found it in the ``sources``
+    list so the downstream persistence step can store composite provenance.
+
+    Args:
+        subfinder_names: Subdomains discovered by Subfinder.
+        amass_names: Subdomains discovered by Amass.
+
+    Returns:
+        A list of dicts with ``name`` and ``sources`` keys.
+    """
+    records: dict[str, set[str]] = {}
+    for name in subfinder_names:
+        label = name.strip().rstrip(".").lower()
+        if label:
+            records.setdefault(label, set()).add("subfinder")
+    for name in amass_names:
+        label = name.strip().rstrip(".").lower()
+        if label:
+            records.setdefault(label, set()).add("amass")
+    return [
+        {"name": name, "sources": sorted(sources)}
+        for name, sources in sorted(records.items())
+    ]
+
+
+async def _unified_resolve(
+    merged: list[dict[str, Any]], amass_resolved: dict[str, list[str]]
+) -> list[dict[str, Any]]:
+    """Resolve merged subdomains, retaining Amass-provided IPs per name.
+
+    DNS resolution is performed in batches of 50 as with Subfinder-only recon.
+    Amass may already have resolved some names during enumeration; those IPs are
+    retained alongside a fresh A/AAAA lookup so the two sources are combined.
+
+    Args:
+        merged: De-duplicated subdomain records (names + tools).
+        amass_resolved: Subdomain → IP mapping produced by Amass.
+
+    Returns:
+        The same records with ``ip_addresses`` attached.
+    """
+    unresolved = [record["name"] for record in merged]
+    resolved = await _resolve_batches(unresolved)
+
+    for record in merged:
+        name = record["name"]
+        ips = set(resolved.get(name, []))
+        ips.update(amass_resolved.get(name, []))
+        record["ip_addresses"] = sorted(ips)
+    return merged
+
+
+async def _persist_unified_recon(
+    domain: str,
+    merged: list[dict[str, Any]],
+    amass_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve merged subdomains, save them, and return recon statistics."""
+    if not merged:
+        logger.info("No subdomains found for %s across tools", domain)
+        return {"domain": domain, "total_subdomains": 0, "unique_ips": 0}
+
+    amass_resolved: dict[str, list[str]] = {}
+    asn_info: list[dict[str, Any]] = []
+    if amass_result and isinstance(amass_result, dict):
+        raw_resolved = amass_result.get("resolved") or {}
+        amass_resolved = {
+            str(name): [str(ip) for ip in ips if isinstance(ip, str)]
+            for name, ips in raw_resolved.items()
+            if isinstance(ips, list)
+        }
+        raw_asns = amass_result.get("asn_info") or []
+        asn_info = [entry for entry in raw_asns if isinstance(entry, dict)]
+
+    enriched = await _unified_resolve(merged, amass_resolved)
+    async with AsyncSessionLocal() as db:
+        counts = await crud.save_unified_recon_results(db, domain, enriched, asn_info)
+
+    unique_ips = len(
+        {ip for record in enriched for ip in record.get("ip_addresses", [])}
+    )
+    tools_used = sorted({label for record in merged for label in record["sources"]})
+    return {
+        "domain": domain,
+        "total_subdomains": counts["subdomains"],
+        "unique_ips": unique_ips,
+        "tools_used": tools_used,
+        "asn_info": asn_info,
+    }
+
+
+@celery_app.task(name="run_unified_recon_task", bind=True)
+def run_unified_recon_task(
+    self: Task,
+    target: str,
+    recon_tools: list[str] | None = None,
+    amass_mode: str = "passive",
+) -> dict[str, Any]:
+    """Run selected recon tools in parallel, merge, resolve, and persist.
+
+    Subfinder and Amass are dispatched as a Celery ``group`` so both run across
+    workers concurrently. Their findings are merged on the caller side: unique
+    subdomain names are kept once (with combined ``sources`` provenance),
+    resolved in DNS batches of 50, and saved idempotently. ASN attribution from
+    Amass is attached to the root ``Domain`` row.
+
+    Celery forbids blocking ``.get()``/``.join()`` inside a task, so the group's
+    per-tool results are polled through their own ``AsyncResult`` states; this
+    doubles as the per-tool progress exposed by the status endpoint.
+
+    Args:
+        target: A validated root FQDN.
+        recon_tools: Subset of ``["subfinder", "amass"]`` to run.
+        amass_mode: ``passive`` or ``active`` (only used with Amass).
+
+    Returns:
+        A dict summarizing total subdomains, unique IPs, used tools, and ASN.
+    """
+    try:
+        domain = validate_domain(target)
+    except ValueError as error:
+        logger.exception("Unified recon failed for target %s", target)
+        self.update_state(state="FAILURE", meta={"error": str(error)})
+        raise
+
+    tools = [
+        tool
+        for tool in (recon_tools if recon_tools is not None else ["subfinder"])
+        if tool in _RECON_TOOLS
+    ]
+    if not tools:
+        self.update_state(state="FAILURE", meta={"error": "no recon tools selected"})
+        raise ValueError("recon_tools must include subfinder and/or amass")
+
+    signatures = []
+    for tool in tools:
+        if tool == "subfinder":
+            signatures.append(run_subfinder_collect_task.s(domain))
+        else:
+            signatures.append(run_amass_collect_task.s(domain, amass_mode))
+
+    self.update_state(
+        state="PROGRESS",
+        meta={"progress": {name: "queued" for name in tools}},
+    )
+    workflow = group(signatures)
+    group_result = workflow.apply_async()
+
+    deadline = time.time() + 3600
+    children = list(group_result.results)
+    while time.time() < deadline:
+        progress: dict[str, str] = {}
+        for tool, child in zip(tools, children):
+            child_state = child.state
+            if child_state in ("PENDING", "STARTED", "RETRY"):
+                progress[tool] = "running"
+            elif child_state == "SUCCESS":
+                progress[tool] = "success"
+            else:
+                progress[tool] = "failed"
+        self.update_state(state="PROGRESS", meta={"progress": progress})
+        if all(child.ready() for child in children):
+            break
+        time.sleep(1)
+
+    subfinder_names: list[str] = []
+    amass_result: dict[str, Any] | None = None
+    for tool, child in zip(tools, children):
+        if (
+            tool == "subfinder"
+            and child.state == "SUCCESS"
+            and isinstance(child.result, list)
+        ):
+            subfinder_names = child.result
+        elif (
+            tool == "amass"
+            and child.state == "SUCCESS"
+            and isinstance(child.result, dict)
+        ):
+            amass_result = child.result
+
+    amass_names = list(amass_result.get("subdomains") or []) if amass_result else []
+    merged = _merge_recon_subdomains(subfinder_names, amass_names)
+    summary = _run_async(_persist_unified_recon(domain, merged, amass_result))
+    summary["tools_used"] = tools
+    summary["status"] = "success"
+    logger.info("Unified recon finished for %s: %s", domain, summary)
+    return summary

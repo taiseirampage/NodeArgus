@@ -29,7 +29,7 @@ def test_run_full_scan_task_runs_recon_then_dispatches_group() -> None:
             "app.tasks.pipeline.validate_domain",
             return_value="hackthebox.com",
         ) as validate,
-        patch("app.tasks.pipeline.run_recon_task") as recon,
+        patch("app.tasks.pipeline.run_unified_recon_task") as recon,
         patch("app.tasks.pipeline._collect_domain_ips") as collect,
         patch(
             "app.tasks.pipeline._group_active_scans", return_value=fake_group
@@ -38,16 +38,21 @@ def test_run_full_scan_task_runs_recon_then_dispatches_group() -> None:
     ):
         recon.run.return_value = {
             "domain": "hackthebox.com",
-            "subdomains": 3,
-            "links": 5,
+            "total_subdomains": 3,
+            "unique_ips": 2,
+            "tools_used": ["subfinder", "amass"],
         }
         collect.return_value = ["1.2.3.4", "5.6.7.8"]
         run_async.return_value = ["1.2.3.4", "5.6.7.8"]
 
-        result = run_full_scan_task.run("hackthebox.com")
+        result = run_full_scan_task.run(
+            "hackthebox.com", ["subfinder", "amass"], "passive"
+        )
 
     validate.assert_called_once_with("hackthebox.com")
-    recon.run.assert_called_once_with("hackthebox.com")
+    recon.run.assert_called_once_with(
+        "hackthebox.com", ["subfinder", "amass"], "passive"
+    )
     group_builder.assert_called_once_with(["1.2.3.4", "5.6.7.8"])
     assert result == {
         "status": "success",
@@ -60,12 +65,16 @@ def test_run_full_scan_task_runs_recon_then_dispatches_group() -> None:
 def test_run_full_scan_task_skips_phase_when_no_ips() -> None:
     with (
         patch("app.tasks.pipeline.validate_domain", return_value="example.com"),
-        patch("app.tasks.pipeline.run_recon_task") as recon,
+        patch("app.tasks.pipeline.run_unified_recon_task") as recon,
         patch("app.tasks.pipeline._collect_domain_ips") as collect,
         patch("app.tasks.pipeline._run_async") as run_async,
         patch("app.tasks.pipeline._group_active_scans") as group_builder,
     ):
-        recon.run.return_value = {"domain": "example.com", "subdomains": 0, "links": 0}
+        recon.run.return_value = {
+            "domain": "example.com",
+            "total_subdomains": 0,
+            "unique_ips": 0,
+        }
         run_async.return_value = []
 
         result = run_full_scan_task.run("example.com")

@@ -7,7 +7,7 @@ celery_app = Celery(
     "nodeargus",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["app.tasks", "app.tasks.recon"],
+    include=["app.tasks", "app.tasks.recon", "app.tasks.amass_recon"],
 )
 celery_app.conf.update(
     task_serializer="json",
@@ -16,4 +16,4 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
 )
-celery_app.autodiscover_tasks(["app.tasks", "app.tasks.recon"])
+celery_app.autodiscover_tasks(["app.tasks", "app.tasks.recon", "app.tasks.amass_recon"])

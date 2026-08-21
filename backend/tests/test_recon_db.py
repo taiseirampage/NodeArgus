@@ -1,5 +1,6 @@
 import os
 from collections.abc import AsyncGenerator
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 import pytest_asyncio
@@ -14,13 +15,27 @@ from app.db import crud
 from app.db.models import Base, Domain, Subdomain
 
 
+def _test_db_url() -> str:
+    """Return a PostgreSQL URL pointing at a dedicated test database.
+
+    DB-backed tests drop and re-create every table, which would destroy the real
+    ``nodeargus`` database. We instead target ``nodeargus_test`` so running the
+    suite never touches production data.
+    """
+    from app.config import settings
+
+    raw = os.environ.get("POSTGRES_ASYNC_URL", settings.POSTGRES_ASYNC_URL)
+    parts = urlsplit(raw)
+    db_name = parts.path.strip("/") or "nodeargus"
+    test_db = os.environ.get("POSTGRES_TEST_DATABASE", f"{db_name}_test")
+    return urlunsplit((parts.scheme, parts.netloc, f"/{test_db}", "", ""))
+
+
 def _is_postgres_reachable() -> bool:
     try:
-        from app.config import settings
-        from urllib.parse import urlsplit
+        url = _test_db_url()
     except Exception:
         return False
-    url = os.environ.get("POSTGRES_ASYNC_URL", settings.POSTGRES_ASYNC_URL)
     try:
         import asyncpg  # noqa: F401
     except Exception:
@@ -46,9 +61,7 @@ _REQUIRE_PG = pytest.mark.skipif(
 
 @pytest_asyncio.fixture
 async def pg_session() -> AsyncGenerator[AsyncSession, None]:
-    from app.config import settings
-
-    url = os.environ.get("POSTGRES_ASYNC_URL", settings.POSTGRES_ASYNC_URL)
+    url = _test_db_url()
     engine = create_async_engine(url)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)

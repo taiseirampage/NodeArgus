@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     GEOIP_LICENSE_KEY: str | None = None
     GEOIP_MIRROR_URL: str | None = None
     GEOIP_AUTO_UPDATE: bool = False
+    AMASS_CONF_PATH: str = "/root/.config/amass/config.yaml"
+    AMASS_WORDLIST_PATH: str = "/usr/share/wordlists/amass/subdomains-top1mil-5000.txt"
+    ALLOW_ACTIVE_RECON: bool = False
 
     model_config = SettingsConfigDict(env_file=PROJECT_ROOT / ".env", extra="ignore")
 

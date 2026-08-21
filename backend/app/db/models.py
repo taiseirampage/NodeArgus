@@ -175,12 +175,18 @@ class Domain(Base):
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
     name: Mapped[str] = mapped_column(String(253), nullable=False, unique=True)
+    asn: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    cidr: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    org_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     subdomains: Mapped[list["Subdomain"]] = relationship(
         back_populates="domain", cascade="all, delete-orphan", lazy="selectin"
+    )
+    asn_records: Mapped[list["ASNInfo"]] = relationship(
+        back_populates="domain", cascade="all, delete-orphan"
     )
 
 
@@ -211,3 +217,33 @@ class Subdomain(Base):
     ip_records: Mapped[list[IP]] = relationship(
         secondary=subdomain_ip_link, back_populates="subdomains", lazy="selectin"
     )
+
+
+class ASNInfo(Base):
+    """Autonomous system information attributed to a root domain by Amass.
+
+    Multiple CIDRs and descriptions can map back to the same ASN number, so the
+    uniqueness constraint is scoped per-domain plus the ASN number.
+    """
+
+    __tablename__ = "asn_info"
+    __table_args__ = (
+        UniqueConstraint("domain_id", "asn_number", name="uq_asn_domain_number"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    domain_id: Mapped[Any] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("domains.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    asn_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    cidr: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    domain: Mapped[Domain] = relationship(back_populates="asn_records")

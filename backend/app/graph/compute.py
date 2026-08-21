@@ -316,9 +316,27 @@ async def compute_domain_graph(db: AsyncSession, domain_name: str) -> GraphRespo
         ip=domain.name,
         node_type="domain",
         ports_count=0,
+        asn_number=domain.asn,
+        asn_cidr=domain.cidr,
+        asn_org=domain.org_name,
     )
     nodes: list[GraphNode] = [domain_node]
     links: list[GraphLink] = []
+
+    # Attach an ASN node for the root domain when attribution is known: the
+    # grey dashed Domain → ASN edge makes infra ownership visible in the graph.
+    if domain.asn:
+        asn_node = GraphNode(
+            id=f"asn:{domain.asn}",
+            ip=f"ASN {domain.asn}",
+            node_type="asn",
+            asn_number=domain.asn,
+            asn_cidr=domain.cidr,
+            asn_org=domain.org_name,
+            ports_count=0,
+        )
+        nodes.append(asn_node)
+        links.append(GraphLink(source=domain.name, target=asn_node.id, type="asn_of"))
 
     for subdomain, ip_records in subdomain_rows:
         subdomain_node = GraphNode(

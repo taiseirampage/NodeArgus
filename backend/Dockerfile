@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 ARG NUCLEI_VERSION=3.4.10
 ARG SUBFINDER_VERSION=2.15.0
+ARG AMASS_VERSION=4.2.0
 ARG TARGETARCH=amd64
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -48,6 +49,30 @@ RUN set -eux; \
         '  - alienvault' \
         '  - commoncrawl' \
         '  - waybackarchive' > /root/.config/subfinder/provider-config.yaml; \
+    case "${TARGETARCH}" in \
+        amd64) amass_arch="amd64" ;; \
+        arm64) amass_arch="arm64" ;; \
+        *) echo "Unsupported Docker architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --location --retry 3 --retry-all-errors \
+        "https://github.com/owasp-amass/amass/releases/download/v${AMASS_VERSION}/amass_Linux_${amass_arch}.zip" \
+        --output /tmp/amass.zip; \
+    unzip -q /tmp/amass.zip -d /tmp/amass-extract; \
+    amass_bin="$(find /tmp/amass-extract -type f -name amass | head -n 1)"; \
+    test -n "${amass_bin}"; \
+    install -m 0755 "${amass_bin}" /usr/local/bin/amass; \
+    rm -rf /tmp/amass.zip /tmp/amass-extract; \
+    mkdir -p /root/.config/amass /usr/share/wordlists/amass; \
+    curl --fail --location --retry 3 --retry-all-errors \
+        "https://raw.githubusercontent.com/owasp-amass/amass/master/examples/wordlists/subdomains-top1mil-5000.txt" \
+        --output /usr/share/wordlists/amass/subdomains-top1mil-5000.txt; \
+    printf '%s\n' \
+        'options:' \
+        '  maximum_dns_queries: 10' \
+        '  bruteforce:' \
+        '    enabled: true' \
+        '    wordlists:' \
+        '      - "/usr/share/wordlists/amass/subdomains-top1mil-5000.txt"' > /root/.config/amass/config.yaml; \
     rm -rf /var/lib/apt/lists/*
 
 RUN nuclei -update-templates -silent -td /root/nuclei-templates

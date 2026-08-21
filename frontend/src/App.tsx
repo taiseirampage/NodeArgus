@@ -28,6 +28,9 @@ function toSelectedNode(node: GraphNode): SelectedNode {
     city: node.city ?? null,
     os: node.os ?? null,
     ports_count: node.ports_count ?? 0,
+    asn_number: node.asn_number ?? null,
+    asn_cidr: node.asn_cidr ?? null,
+    asn_org: node.asn_org ?? null,
   }
 }
 
