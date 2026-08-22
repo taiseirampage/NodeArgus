@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.geo.geoip import GeoIPService
@@ -18,9 +19,11 @@ from .models import (
     ASNInfo,
     IP,
     Domain,
+    Endpoint,
     Link,
     Port,
     Subdomain,
+    WebTech,
     subdomain_ip_link,
     Vulnerability,
 )
@@ -182,6 +185,7 @@ async def save_scan_result(
         "provider": geo.isp,
         "os": result.os_detection,
         "scripts_info": result.scripts_output or None,
+        "has_anonymous_access": result.has_anonymous_access,
         "traceroute": [hop.model_dump() for hop in result.traceroute] or None,
         "last_scan": scan_time,
     }
@@ -761,3 +765,133 @@ async def save_unified_recon_results(
         "ip_links": saved_links,
         "asn_records": saved_asn,
     }
+
+
+async def get_ips_with_web_ports(
+    db: AsyncSession,
+    ip_addresses: list[str],
+    web_ports: set[int] | list[int] | frozenset[int],
+) -> list[str]:
+    """Return the subset of ``ip_addresses`` that have an open web port.
+
+    Only hosts already audited by Masscan/Nmap are considered, so httpx and
+    katana are never pointed at arbitrary addresses — this enforces the "web
+    recon runs only on hosts with live HTTP/HTTPS services" pipeline rule.
+
+    Args:
+        db: The active async session.
+        ip_addresses: Candidate IP strings.
+        web_ports: Port numbers to treat as web services.
+
+    Returns:
+        The de-duplicated list of IP strings that have at least one matching
+        open port.
+    """
+    if not ip_addresses:
+        return []
+    port_numbers = [int(port) for port in web_ports]
+    statement = (
+        select(IP.ip_address)
+        .join(Port, Port.ip_id == IP.id)
+        .where(IP.ip_address.in_(ip_addresses), Port.port_number.in_(port_numbers))
+        .distinct()
+    )
+    result = await db.execute(statement)
+    return [str(row[0]) for row in result.all()]
+
+
+async def get_ip_id_by_hostname(db: AsyncSession, hostname: str) -> Any | None:
+    """Return the id of an IP record linked to a subdomain hostname."""
+    statement = (
+        select(IP.id)
+        .join(subdomain_ip_link, subdomain_ip_link.c.ip_id == IP.id)
+        .join(Subdomain, Subdomain.id == subdomain_ip_link.c.subdomain_id)
+        .where(Subdomain.name == hostname.rstrip("."))
+        .limit(1)
+    )
+    result = await db.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def get_or_create_ip_id(db: AsyncSession, ip: str) -> Any:
+    """Return the id of an IP record, inserting a minimal row when new."""
+    return await _upsert_ip(db, ip)
+
+
+async def save_web_recon_result(
+    db: AsyncSession,
+    web_records: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Persist httpx web probes and their katana endpoints for some IP records.
+
+    Existing ``web_techs`` and ``endpoints`` rows for the affected IPs are
+    replaced so a re-run never duplicates probes or crawled URLs. Each
+    ``web_records`` entry is a dict with ``ip_id``, ``url``, ``status_code``,
+    ``title``, ``technologies`` (list), ``web_server`` and ``endpoints`` (list
+    of ``{"path", "method", "source"}``).
+
+    Args:
+        db: The active async session.
+        web_records: Normalized web probes with their crawled endpoints.
+
+    Returns:
+        A dict summarizing the number of web techs and endpoints saved.
+    """
+    ip_ids = {
+        int(record["ip_id"])
+        for record in web_records
+        if record.get("ip_id") is not None
+    }
+    if ip_ids:
+        web_tech_ids = select(WebTech.id).where(WebTech.ip_id.in_(ip_ids))
+        await db.execute(delete(Endpoint).where(Endpoint.web_tech_id.in_(web_tech_ids)))
+        await db.execute(delete(WebTech).where(WebTech.ip_id.in_(ip_ids)))
+
+    saved_web = 0
+    saved_endpoints = 0
+    for record in web_records:
+        web_tech = WebTech(
+            ip_id=int(record["ip_id"]),
+            url=str(record["url"])[:2048],
+            status_code=record.get("status_code"),
+            title=record.get("title"),
+            technologies=record.get("technologies") or None,
+            web_server=record.get("web_server"),
+        )
+        db.add(web_tech)
+        await db.flush()
+        saved_web += 1
+        endpoints = record.get("endpoints")
+        if not isinstance(endpoints, list):
+            continue
+        for entry in endpoints:
+            path = entry.get("path")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            db.add(
+                Endpoint(
+                    web_tech_id=web_tech.id,
+                    path=path.strip()[:2048],
+                    method=str(entry.get("method") or "GET")[:16],
+                    source=entry.get("source"),
+                )
+            )
+            saved_endpoints += 1
+
+    await db.commit()
+    logger.info(
+        "Web recon saved: %d web techs, %d endpoints", saved_web, saved_endpoints
+    )
+    return {"web_techs": saved_web, "endpoints": saved_endpoints}
+
+
+async def get_web_techs_by_ip(db: AsyncSession, ip_id: int) -> list[WebTech]:
+    """Return an IP's web probes with their crawled endpoints loaded."""
+    statement = (
+        select(WebTech)
+        .where(WebTech.ip_id == ip_id)
+        .options(selectinload(WebTech.endpoints))
+        .order_by(WebTech.id)
+    )
+    result = await db.execute(statement)
+    return list(result.scalars().all())

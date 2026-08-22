@@ -42,6 +42,7 @@ class NmapResult(BaseModel):
     geo: GeoLocation | None = None
     scripts_output: dict[str, str] = Field(default_factory=dict)
     traceroute: list["NmapHop"] = Field(default_factory=list)
+    has_anonymous_access: bool = False
 
 
 class NmapHop(BaseModel):

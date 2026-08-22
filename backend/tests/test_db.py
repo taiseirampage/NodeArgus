@@ -149,6 +149,7 @@ async def test_save_scan_result_persists_geo_and_services(
     assert record.provider == "Example ISP"
     assert record.os == "Linux"
     assert record.scripts_info == {"http-title": "Title: Example"}
+    assert record.has_anonymous_access is False
     assert ports[0].banner == "nginx 1.25"
 
 
@@ -195,3 +196,21 @@ async def test_save_scan_result_updates_duplicate_ip_without_duplicate_ports(
     assert second_record.os == "FreeBSD"
     assert len(ports) == 1
     assert ports[0].port_number == 443
+
+
+@pytest.mark.asyncio
+async def test_save_scan_result_persists_anonymous_access_flag(
+    db_session: AsyncSession,
+) -> None:
+    result = NmapResult(
+        target="8.8.8.8",
+        os_detection="",
+        services=[NmapService(port=21, protocol="tcp", service="ftp", version="")],
+        scan_time=0.1,
+        scripts_output={"ftp-anon": "Anonymous FTP login allowed (FTP code 230)"},
+        has_anonymous_access=True,
+    )
+
+    record = await crud.save_scan_result(db_session, result, GeoLocation(ip="8.8.8.8"))
+
+    assert record.has_anonymous_access is True

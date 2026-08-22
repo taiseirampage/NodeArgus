@@ -3,6 +3,8 @@ FROM python:3.11-slim
 ARG NUCLEI_VERSION=3.4.10
 ARG SUBFINDER_VERSION=2.15.0
 ARG AMASS_VERSION=4.2.0
+ARG HTTTPX_VERSION=1.10.0
+ARG KATANA_VERSION=1.7.0
 ARG TARGETARCH=amd64
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -73,6 +75,28 @@ RUN set -eux; \
         '    enabled: true' \
         '    wordlists:' \
         '      - "/usr/share/wordlists/amass/subdomains-top1mil-5000.txt"' > /root/.config/amass/config.yaml; \
+    case "${TARGETARCH}" in \
+        amd64) httpx_arch="amd64" ;; \
+        arm64) httpx_arch="arm64" ;; \
+        *) echo "Unsupported Docker architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --location --retry 3 --retry-all-errors \
+        "https://github.com/projectdiscovery/httpx/releases/download/v${HTTTPX_VERSION}/httpx_${HTTTPX_VERSION}_linux_${httpx_arch}.zip" \
+        --output /tmp/httpx.zip; \
+    unzip -q /tmp/httpx.zip -d /tmp/httpx; \
+    install -m 0755 /tmp/httpx/httpx /usr/local/bin/httpx; \
+    rm -rf /tmp/httpx /tmp/httpx.zip; \
+    case "${TARGETARCH}" in \
+        amd64) katana_arch="amd64" ;; \
+        arm64) katana_arch="arm64" ;; \
+        *) echo "Unsupported Docker architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --location --retry 3 --retry-all-errors \
+        "https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_${katana_arch}.zip" \
+        --output /tmp/katana.zip; \
+    unzip -q /tmp/katana.zip -d /tmp/katana; \
+    install -m 0755 /tmp/katana/katana /usr/local/bin/katana; \
+    rm -rf /tmp/katana /tmp/katana.zip; \
     rm -rf /var/lib/apt/lists/*
 
 RUN nuclei -update-templates -silent -td /root/nuclei-templates

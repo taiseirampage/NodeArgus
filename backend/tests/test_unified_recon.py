@@ -144,6 +144,7 @@ def test_unified_recon_degrades_when_amass_disabled() -> None:
         patch.object(run_unified_recon_task, "update_state"),
         patch("app.tasks.recon._run_async", side_effect=asyncio.run),
         patch("app.tasks.recon.time.sleep"),
+        patch("app.tasks.recon.run_web_recon_task") as web_recon,
     ):
         result = _execute_task(
             "example.com",
@@ -154,6 +155,7 @@ def test_unified_recon_degrades_when_amass_disabled() -> None:
     assert result["status"] == "partial"
     assert persist.call_args.args[1][0]["name"] == "a.example.com"
     assert result["tool_errors"] == {"amass": "active recon is disabled"}
+    web_recon.delay.assert_called_once_with("example.com")
 
 
 def test_unified_recon_dispatches_group_and_merges() -> None:
@@ -191,6 +193,7 @@ def test_unified_recon_dispatches_group_and_merges() -> None:
         patch.object(run_unified_recon_task, "update_state"),
         patch("app.tasks.recon._run_async", side_effect=asyncio.run),
         patch("app.tasks.recon.time.sleep"),
+        patch("app.tasks.recon.run_web_recon_task") as web_recon,
     ):
         result = _execute_task(
             "example.com",
@@ -203,6 +206,8 @@ def test_unified_recon_dispatches_group_and_merges() -> None:
     assert result["status"] == "success"
     assert result["total_subdomains"] == 3
     assert result["tools_used"] == ["subfinder", "amass"]
+    web_recon.delay.assert_called_once_with("example.com")
+    assert result["web_recon_dispatched"] is True
 
 
 def test_scan_request_ip_target_ignores_recon_tools() -> None:

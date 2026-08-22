@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,13 +9,17 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
-from .validator import validate_target
+from app.config import settings
+
+from .validator import validate_target, validate_web_target
 
 
 logger = logging.getLogger(__name__)
 Severity = Literal["critical", "high", "medium", "low", "info"]
+_TAG_PATTERN = re.compile(r"[a-z][a-z0-9_-]*")
 NUCLEI_OUTPUT_PATH = Path("/tmp/nuclei_output.json")
 NUCLEI_SCAN_TIMEOUT_SECONDS = 300
+NUCLEI_WAF_BYPASS_TIMEOUT_SECONDS = 3600
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -23,9 +28,10 @@ DEFAULT_NUCLEI_OPTIONS: list[str] = [
     "-jsonl",
     "-silent",
     "-timeout",
-    "5",
+    "15",
     "-retries",
-    "1",
+    "3",
+    "-fr",
     "-rate-limit",
     "150",
     "-concurrency",
@@ -35,6 +41,22 @@ DEFAULT_NUCLEI_OPTIONS: list[str] = [
     "-bulk-size",
     "25",
 ]
+WAF_BYPASS_BULK_SIZE = "50"
+WAF_BYPASS_HEADERS: list[str] = [
+    "-H",
+    "X-Forwarded-For: 127.0.0.1",
+    "-H",
+    "X-Originating-IP: 127.0.0.1",
+    "-H",
+    "X-Remote-IP: 127.0.0.1",
+    "-H",
+    "X-Client-IP: 127.0.0.1",
+]
+WAF_BYPASS_VARS: dict[str, str] = {
+    "waf_admin_url": "/a%64min",
+    "waf_double_encoding": "%252e%252e%252f",
+    "waf_case_variations": "/Admin,/ADMIN,/aDmIn",
+}
 
 
 class NucleiVulnerability(BaseModel):
@@ -144,6 +166,55 @@ def validate_user_agent(user_agent: str | None) -> str:
     return value
 
 
+def validate_tags(tags: list[str] | str | None) -> str | None:
+    """Validate and normalize a Nuclei ``-tags`` expression.
+
+    Tags are used as a single argv element, so only safe identifier tokens
+    joined by ``,`` (OR) or ``&&`` (AND) are accepted to prevent injection.
+
+    Args:
+        tags: Either a comma/``&&``-joined string or a list of tag tokens.
+
+    Returns:
+        A single safe ``-tags`` value, or None when nothing was provided.
+
+    Raises:
+        ValueError: If any token is not a safe identifier.
+    """
+    if tags is None:
+        return None
+    tokens = tags.split(",") if isinstance(tags, str) else list(tags)
+    normalized: list[str] = []
+    for token in tokens:
+        for part in token.strip().split("&&"):
+            if not _TAG_PATTERN.fullmatch(part):
+                raise ValueError(f"invalid nuclei tag: {part!r}")
+        if token.strip():
+            normalized.append(token.strip())
+    return ",".join(normalized) if normalized else None
+
+
+def validate_nuclei_target(target: str) -> str:
+    """Validate a Nuclei target: an IP/CIDR or an http(s) web host URL.
+
+    Virtual-hosted sites (the common web-hosting case) must be scanned by their
+    hostname URL, not by the bare IP, so Nuclei sends the correct Host header.
+    Bare IPs/CIDRs keep the strict ``validate_target`` path.
+
+    Args:
+        target: An IP, CIDR, or ``http(s)://`` web URL.
+
+    Returns:
+        The normalized target.
+
+    Raises:
+        ValueError: If the target is unsafe or malformed.
+    """
+    if "://" in target:
+        return validate_web_target(target)
+    return validate_target(target)
+
+
 def _read_output(stdout: str | bytes | None) -> str:
     if NUCLEI_OUTPUT_PATH.exists():
         try:
@@ -160,11 +231,19 @@ def _build_command(
     proxy: str | None,
     user_agent: str | None,
     stealth_mode: bool,
+    waf_bypass_mode: bool,
 ) -> list[str]:
     options = list(DEFAULT_NUCLEI_OPTIONS)
     if stealth_mode:
         options[options.index("-timeout") + 1] = "15"
         options[options.index("-rate-limit") + 1] = "10"
+    if waf_bypass_mode:
+        options[options.index("-rate-limit") + 1] = str(settings.WAF_BYPASS_RATE_LIMIT)
+        options[options.index("-bulk-size") + 1] = WAF_BYPASS_BULK_SIZE
+        options[options.index("-concurrency") + 1] = str(
+            settings.WAF_BYPASS_CONCURRENCY
+        )
+        options.extend(["-mr", "10", "-fh2"])
     command = [
         "nuclei",
         "-target",
@@ -174,6 +253,10 @@ def _build_command(
         str(NUCLEI_OUTPUT_PATH),
     ]
     command.extend(["-H", f"User-Agent: {validate_user_agent(user_agent)}"])
+    if waf_bypass_mode:
+        command.extend(WAF_BYPASS_HEADERS)
+        for key, value in WAF_BYPASS_VARS.items():
+            command.extend(["-var", f"{key}={value}"])
     if proxy:
         command.extend(["-proxy", validate_proxy(proxy)])
     if severity_filter:
@@ -190,14 +273,19 @@ def run_nuclei(
     proxy: str | None = None,
     user_agent: str | None = None,
     stealth_mode: bool = False,
+    waf_bypass_mode: bool = False,
 ) -> NucleiResult:
     """Run Nuclei with validated arguments and normalize JSONL findings.
+
+    ``stealth_mode`` and ``waf_bypass_mode`` are mutually exclusive: the former
+    slows the scan to avoid detection while the latter makes it aggressive to
+    push past Web Application Firewalls.
 
     Nuclei is installed as a system executable in the application image. Scanner
     failures are logged and represented as an empty result so a missing optional
     scanner cannot crash the API process.
     """
-    validated_target = validate_target(target)
+    validated_target = validate_nuclei_target(target)
     command = _build_command(
         validated_target,
         severity_filter,
@@ -205,6 +293,12 @@ def run_nuclei(
         proxy,
         user_agent,
         stealth_mode,
+        waf_bypass_mode,
+    )
+    scan_timeout = (
+        NUCLEI_WAF_BYPASS_TIMEOUT_SECONDS
+        if waf_bypass_mode
+        else NUCLEI_SCAN_TIMEOUT_SECONDS
     )
     try:
         NUCLEI_OUTPUT_PATH.unlink(missing_ok=True)
@@ -214,7 +308,7 @@ def run_nuclei(
             text=True,
             check=False,
             shell=False,
-            timeout=NUCLEI_SCAN_TIMEOUT_SECONDS,
+            timeout=scan_timeout,
         )
         if completed.returncode != 0:
             logger.error(
@@ -235,7 +329,9 @@ def run_nuclei(
     except subprocess.TimeoutExpired as error:
         partial_output = _read_output(error.stdout)
         vulnerabilities = _parse_output(partial_output, validated_target)
-        logger.warning("Nuclei scan timeout after 300s, returning partial results")
+        logger.warning(
+            "Nuclei scan timeout after %ds, returning partial results", scan_timeout
+        )
         return NucleiResult(
             target=validated_target,
             vulnerabilities=vulnerabilities,

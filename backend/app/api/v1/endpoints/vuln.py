@@ -8,11 +8,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import VulnScanResponse, VulnerabilityResponse
 from app.celery_worker import celery_app
+from app.config import settings
 from app.db import crud
 from app.db.database import get_db
-from app.scanner.nuclei_wrapper import validate_proxy, validate_user_agent
+from app.scanner.nuclei_wrapper import (
+    validate_proxy,
+    validate_tags,
+    validate_user_agent,
+)
 from app.scanner.validator import validate_target
-from app.tasks import run_vuln_scan_task
+from app.tasks import run_vuln_scan_task, run_web_host_vuln_scan_task
 
 
 router = APIRouter()
@@ -48,6 +53,82 @@ def _vulnerability_response(value: object) -> VulnerabilityResponse:
 
 
 @router.post(
+    "/{ip}/web", status_code=status.HTTP_202_ACCEPTED, response_model=VulnScanResponse
+)
+async def create_web_host_vulnerability_scan(
+    ip: str,
+    force: bool = False,
+    db: AsyncSession = Depends(get_db),
+    proxy: str | None = None,
+    user_agent: str | None = None,
+    use_stealth_mode: bool = False,
+    waf_bypass_mode: bool = False,
+    tags: list[str] | None = None,
+) -> VulnScanResponse:
+    """Queue a Nuclei scan against the IP's discovered web hosts.
+
+    Scanning the bare IP misses findings on shared/virtual-host hosting where
+    the site only answers for its hostname. This endpoint probes every WebTech
+    URL recorded for the IP, so Nuclei sees the correct virtual host. Findings
+    are stored under the IP node and surfaced by the usual status endpoints.
+
+    Args:
+        ip: A single validated IP address known to NodeArgus.
+        force: When False, reuse the 24-hour cached results.
+        proxy: Optional HTTP(S)/SOCKS5 proxy URL.
+        user_agent: Optional custom User-Agent header.
+        use_stealth_mode: Slow the scan down to avoid WAF detection.
+        waf_bypass_mode: Aggressive WAF bypass flags/headers.
+        tags: Optional Nuclei template tags (repeated query param, e.g.
+            ``?tags=wordpress&tags=cve``) to widen or narrow coverage.
+
+    Returns:
+        A VulnScanResponse describing the queued web-host scan task.
+    """
+    normalized_ip, ip_id = await _get_ip_or_404(ip, db)
+    web_techs = await crud.get_web_techs_by_ip(db, ip_id)
+    if not web_techs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No web hosts recorded for this IP; run web recon first",
+        )
+    if waf_bypass_mode and use_stealth_mode:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="WAF Bypass Mode and Stealth Mode are mutually exclusive; "
+            "enable only one of them",
+        )
+    if waf_bypass_mode and not settings.ALLOW_WAF_BYPASS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="WAF Bypass Mode is disabled; set ALLOW_WAF_BYPASS=true in "
+            ".env to enable it",
+        )
+    try:
+        validated_proxy = validate_proxy(proxy) if proxy else None
+        validated_user_agent = validate_user_agent(user_agent) if user_agent else None
+        validated_tags = validate_tags(tags)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    task_options: dict[str, object] = {}
+    if validated_proxy is not None:
+        task_options["proxy"] = validated_proxy
+    if validated_user_agent is not None:
+        task_options["user_agent"] = validated_user_agent
+    if validated_tags is not None:
+        task_options["tags"] = [validated_tags]
+    if use_stealth_mode:
+        task_options["use_stealth_mode"] = True
+    if waf_bypass_mode:
+        task_options["waf_bypass_mode"] = True
+    task = run_web_host_vuln_scan_task.delay(normalized_ip, force, **task_options)
+    return VulnScanResponse(task_id=task.id, status="queued")
+
+
+@router.post(
     "/{ip}", status_code=status.HTTP_202_ACCEPTED, response_model=VulnScanResponse
 )
 async def create_vulnerability_scan(
@@ -57,9 +138,22 @@ async def create_vulnerability_scan(
     proxy: str | None = None,
     user_agent: str | None = None,
     use_stealth_mode: bool = False,
+    waf_bypass_mode: bool = False,
 ) -> VulnScanResponse:
     """Queue a Nuclei scan for an IP already known to NodeArgus."""
     normalized_ip, _ = await _get_ip_or_404(ip, db)
+    if waf_bypass_mode and use_stealth_mode:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="WAF Bypass Mode and Stealth Mode are mutually exclusive; "
+            "enable only one of them",
+        )
+    if waf_bypass_mode and not settings.ALLOW_WAF_BYPASS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="WAF Bypass Mode is disabled; set ALLOW_WAF_BYPASS=true in "
+            ".env to enable it",
+        )
     try:
         validated_proxy = validate_proxy(proxy) if proxy else None
         validated_user_agent = validate_user_agent(user_agent) if user_agent else None
@@ -75,6 +169,8 @@ async def create_vulnerability_scan(
         task_options["user_agent"] = validated_user_agent
     if use_stealth_mode:
         task_options["use_stealth_mode"] = True
+    if waf_bypass_mode:
+        task_options["waf_bypass_mode"] = True
     task = run_vuln_scan_task.delay(normalized_ip, force, **task_options)
     return VulnScanResponse(task_id=task.id, status="queued")
 

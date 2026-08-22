@@ -21,8 +21,10 @@ from app.scanner.masscan_wrapper import run_masscan
 from app.scanner.nmap_wrapper import run_nmap
 from app.scanner.nuclei_wrapper import (
     NucleiResult,
+    NucleiVulnerability,
     run_nuclei,
     validate_proxy,
+    validate_tags,
     validate_user_agent,
 )
 from app.scanner.validator import validate_target
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 _AsyncResult = TypeVar("_AsyncResult")
 _worker_loop: asyncio.AbstractEventLoop | None = None
 _worker_loop_lock = threading.Lock()
+WAF_BYPASS_TASK_TIMEOUT_SECONDS = 3600
 
 
 async def _save_scan_result(result: NmapResult, geo: GeoLocation) -> None:
@@ -111,6 +114,7 @@ async def _run_vulnerability_scan(
     proxy: str | None,
     user_agent: str | None,
     use_stealth_mode: bool,
+    waf_bypass_mode: bool,
 ) -> dict[str, Any]:
     """Check the database cache, scan when necessary, and persist findings."""
     async with AsyncSessionLocal() as db:
@@ -135,14 +139,16 @@ async def _run_vulnerability_scan(
             }
 
         start_time = time.time()
-        severity = "critical,high,medium"
-        nuclei_options: dict[str, Any] = {"severity_filter": severity}
+        # No severity filter: Nuclei reports all severities (info/low/...).
+        nuclei_options: dict[str, Any] = {}
         if proxy is not None:
             nuclei_options["proxy"] = proxy
         if user_agent is not None:
             nuclei_options["user_agent"] = user_agent
         if use_stealth_mode:
             nuclei_options["stealth_mode"] = True
+        if waf_bypass_mode:
+            nuclei_options["waf_bypass_mode"] = True
         nuclei_result: NucleiResult = run_nuclei(target, **nuclei_options)
         elapsed = time.time() - start_time
         logger.info(
@@ -168,15 +174,38 @@ def run_vuln_scan_task(
     proxy: str | None = None,
     user_agent: str | None = None,
     use_stealth_mode: bool = False,
+    waf_bypass_mode: bool = False,
 ) -> dict[str, Any]:
-    """Run or reuse a 24-hour cached Nuclei vulnerability scan."""
+    """Run or reuse a 24-hour cached Nuclei vulnerability scan.
+
+    ``waf_bypass_mode`` and ``use_stealth_mode`` are mutually exclusive because
+    they push the scan in opposite directions: stealth mode slows the scan down
+    to avoid detection, while WAF bypass mode accelerates it with aggressive
+    concurrency and retries to get past Web Application Firewalls.
+    """
     try:
+        if waf_bypass_mode and use_stealth_mode:
+            raise ValueError(
+                "WAF Bypass Mode and Stealth Mode are mutually exclusive; "
+                "enable only one of them"
+            )
+        if waf_bypass_mode and not settings.ALLOW_WAF_BYPASS:
+            raise ValueError(
+                "WAF Bypass Mode is disabled; set ALLOW_WAF_BYPASS=true in .env "
+                "to enable it"
+            )
         validated_target = validate_target(target)
         if "," in validated_target or "/" in validated_target:
             raise ValueError("vulnerability scans require one IP address")
         validated_target = str(ipaddress.ip_address(validated_target))
         validated_proxy = validate_proxy(proxy) if proxy else None
         validated_user_agent = validate_user_agent(user_agent) if user_agent else None
+        if waf_bypass_mode:
+            self.request.time_limit = WAF_BYPASS_TASK_TIMEOUT_SECONDS
+            self.request.soft_time_limit = WAF_BYPASS_TASK_TIMEOUT_SECONDS
+            logger.info(
+                "[WAF BYPASS MODE] Starting aggressive scan for %s", validated_target
+            )
         return _run_async(
             _run_vulnerability_scan(
                 validated_target,
@@ -184,10 +213,181 @@ def run_vuln_scan_task(
                 validated_proxy,
                 validated_user_agent,
                 use_stealth_mode,
+                waf_bypass_mode,
             )
         )
     except Exception as error:
         logger.exception("Vulnerability scan task failed for target %s", target)
+        raise
+
+
+async def _run_web_host_vulnerability_scan(
+    target: str,
+    force: bool,
+    proxy: str | None,
+    user_agent: str | None,
+    use_stealth_mode: bool,
+    waf_bypass_mode: bool,
+    tags: str | None = None,
+) -> dict[str, Any]:
+    """Scan the discovered web hosts of one IP with Nuclei and persist them.
+
+    Fetches the WebTech hosts recorded for the IP (from web recon) and runs one
+    Nuclei pass per hostname URL so virtual-hosted sites are probed with the
+    correct Host header. Findings are deduplicated and stored against the IP.
+
+    Args:
+        target: A single validated IP address.
+        force: When False, reuse the 24-hour cache.
+        proxy: Optional HTTP(S)/SOCKS5 proxy URL.
+        user_agent: Optional custom User-Agent header.
+        use_stealth_mode: Slow the scan down to avoid WAF detection.
+        waf_bypass_mode: Enables aggressive WAF bypass flags/headers.
+
+    Returns:
+        A dict with the status and number of vulnerabilities saved.
+    """
+    async with AsyncSessionLocal() as db:
+        record = await crud.get_ip_by_address(db, target)
+        if record is None:
+            raise ValueError("IP not found in database")
+        now = datetime.now(timezone.utc)
+        if not force:
+            last_scan = await crud.get_last_vuln_scan(db, record.id)
+            if last_scan is not None:
+                if last_scan.tzinfo is None:
+                    last_scan = last_scan.replace(tzinfo=timezone.utc)
+                if now - last_scan.astimezone(timezone.utc) < timedelta(hours=24):
+                    cached = await crud.get_vulnerabilities_by_ip(db, record.id)
+                    logger.info("Using cached web-host results for %s", target)
+                    return {
+                        "status": "cached",
+                        "message": "Results from cache",
+                        "vulnerabilities": [
+                            _vulnerability_payload(item) for item in cached
+                        ],
+                    }
+
+        web_techs = await crud.get_web_techs_by_ip(db, record.id)
+        hosts: list[str] = []
+        seen: set[str] = set()
+        for tech in web_techs:
+            url = (tech.url or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            hosts.append(url)
+        if not hosts:
+            logger.info("No web hosts found for %s; skipping web-host scan", target)
+            return {"status": "success", "vulnerabilities_count": 0}
+
+        nuclei_options: dict[str, Any] = {}
+        if proxy is not None:
+            nuclei_options["proxy"] = proxy
+        if user_agent is not None:
+            nuclei_options["user_agent"] = user_agent
+        if use_stealth_mode:
+            nuclei_options["stealth_mode"] = True
+        if waf_bypass_mode:
+            nuclei_options["waf_bypass_mode"] = True
+        if tags:
+            nuclei_options["tags_filter"] = tags
+
+        findings: list[Any] = []
+        nuclei_vulnerabilities: list[NucleiVulnerability] = []
+        timed_out = False
+        start_time = time.time()
+        for host in hosts:
+            nuclei_result = run_nuclei(host, **nuclei_options)
+            timed_out = timed_out or nuclei_result.timed_out
+            nuclei_vulnerabilities.extend(nuclei_result.vulnerabilities)
+            findings.extend(nuclei_result.vulnerabilities)
+        elapsed = time.time() - start_time
+        logger.info(
+            "Web-host Nuclei scan for %s completed in %.2fs, hosts=%d vulns=%d",
+            target,
+            elapsed,
+            len(hosts),
+            len(findings),
+        )
+        await crud.save_vulnerabilities(db, record.id, nuclei_vulnerabilities)
+
+        result: dict[str, Any] = {
+            "status": "success",
+            "target": target,
+            "hosts_scanned": len(hosts),
+            "vulnerabilities_count": len(findings),
+        }
+        if timed_out:
+            result["message"] = "Nuclei timed out; partial results saved"
+        return result
+
+
+@celery_app.task(name="run_web_host_vuln_scan_task", bind=True)
+def run_web_host_vuln_scan_task(
+    self: Task,
+    target: str,
+    force: bool = False,
+    proxy: str | None = None,
+    user_agent: str | None = None,
+    use_stealth_mode: bool = False,
+    waf_bypass_mode: bool = False,
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run Nuclei against the web hosts of an IP.
+
+    General-purpose ``-u http://<ip>`` scans fail on shared/virtual-host
+    hosting because the server only answers for the correct Host header. This
+    task reads the WebTech hosts recorded for the IP and scans each hostname URL
+    instead, which is the only way Nuclei sees the actual vHost.
+
+    Args:
+        target: A single validated IP address.
+        force: When False, reuse results cached in the last 24 hours.
+        proxy: Optional HTTP(S)/SOCKS5 proxy URL.
+        user_agent: Optional custom User-Agent header.
+        use_stealth_mode: Slow the scan to avoid WAF detection.
+        waf_bypass_mode: Aggressive WAF bypass flags/headers.
+        tags: Optional Nuclei template tags (e.g. ``["wordpress", "cve"]``) to
+            widen or narrow coverage; validated as safe tokens.
+
+    Returns:
+        A dict summarizing the number of vulnerabilities found.
+    """
+    try:
+        if waf_bypass_mode and use_stealth_mode:
+            raise ValueError(
+                "WAF Bypass Mode and Stealth Mode are mutually exclusive; "
+                "enable only one of them"
+            )
+        if waf_bypass_mode and not settings.ALLOW_WAF_BYPASS:
+            raise ValueError(
+                "WAF Bypass Mode is disabled; set ALLOW_WAF_BYPASS=true in .env "
+                "to enable it"
+            )
+        validated_target = validate_target(target)
+        if "," in validated_target or "/" in validated_target:
+            raise ValueError("web-host vulnerability scans require one IP address")
+        validated_target = str(ipaddress.ip_address(validated_target))
+        validated_proxy = validate_proxy(proxy) if proxy else None
+        validated_user_agent = validate_user_agent(user_agent) if user_agent else None
+        validated_tags = validate_tags(tags)
+        if waf_bypass_mode:
+            self.request.time_limit = WAF_BYPASS_TASK_TIMEOUT_SECONDS
+            self.request.soft_time_limit = WAF_BYPASS_TASK_TIMEOUT_SECONDS
+        return _run_async(
+            _run_web_host_vulnerability_scan(
+                validated_target,
+                force,
+                validated_proxy,
+                validated_user_agent,
+                use_stealth_mode,
+                waf_bypass_mode,
+                validated_tags,
+            )
+        )
+    except Exception as error:
+        logger.exception("Web host vulnerability scan failed for target %s", target)
         raise
 
 

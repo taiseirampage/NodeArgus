@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import crud
 from app.db.database import get_db
-from app.db.schemas import IPDetailsResponse, PortDetailsResponse
+from app.db.schemas import IPDetailsResponse, PortDetailsResponse, WebTechResponse
 from app.scanner.validator import validate_target
 
 
@@ -37,8 +37,13 @@ async def get_ip_details(
             detail="IP not found in database",
         )
     ports = await crud.get_ports_by_ip(db, record.id)
+    web_techs = await crud.get_web_techs_by_ip(db, record.id)
     logger.warning(
-        "GET /ip/%s: ip_id=%d ports_found=%d", normalized_ip, record.id, len(ports)
+        "GET /ip/%s: ip_id=%d ports_found=%d web_techs=%d",
+        normalized_ip,
+        record.id,
+        len(ports),
+        len(web_techs),
     )
     return IPDetailsResponse(
         ip=str(record.ip_address),
@@ -47,6 +52,8 @@ async def get_ip_details(
         os=record.os,
         provider=record.provider,
         scripts_info=record.scripts_info or {},
+        has_anonymous_access=record.has_anonymous_access,
         traceroute=record.traceroute or [],
         ports=[PortDetailsResponse.model_validate(port) for port in ports],
+        web_techs=[WebTechResponse.model_validate(tech) for tech in web_techs],
     )

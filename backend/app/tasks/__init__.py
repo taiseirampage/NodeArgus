@@ -16,12 +16,14 @@ from app.tasks.scan import (
     run_nmap,
     run_scan_task,
     run_vuln_scan_task,
+    run_web_host_vuln_scan_task,
     validate_target,
 )
 
 from app.tasks.recon import run_recon_task, run_unified_recon_task
 from app.tasks.amass_recon import run_amass_task
-from app.tasks.pipeline import run_full_scan_task
+from app.tasks.web_recon import run_web_recon_task
+from app.tasks.pipeline import dispatch_web_recon_task, run_full_scan_task
 
 __all__ = [
     "AsyncSessionLocal",
@@ -33,9 +35,12 @@ __all__ = [
     "run_nmap",
     "run_scan_task",
     "run_vuln_scan_task",
+    "run_web_host_vuln_scan_task",
     "validate_target",
     "run_recon_task",
     "run_unified_recon_task",
     "run_amass_task",
+    "run_web_recon_task",
+    "dispatch_web_recon_task",
     "run_full_scan_task",
 ]

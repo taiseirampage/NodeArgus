@@ -82,6 +82,9 @@ class IP(Base):
     )
     traceroute_hop: Mapped[int | None] = mapped_column(Integer, nullable=True)
     traceroute_rtt: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    has_anonymous_access: Mapped[bool] = mapped_column(
+        nullable=False, server_default=false()
+    )
     last_scan: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -101,6 +104,9 @@ class IP(Base):
     )
     subdomains: Mapped[list["Subdomain"]] = relationship(
         secondary=subdomain_ip_link, back_populates="ip_records"
+    )
+    web_techs: Mapped[list["WebTech"]] = relationship(
+        back_populates="ip", cascade="all, delete-orphan"
     )
 
 
@@ -247,3 +253,48 @@ class ASNInfo(Base):
     )
 
     domain: Mapped[Domain] = relationship(back_populates="asn_records")
+
+
+class WebTech(Base):
+    """A live web property (httpx probe) attached to an IP record."""
+
+    __tablename__ = "web_techs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ip_id: Mapped[int] = mapped_column(
+        ForeignKey("ips.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    title: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    technologies: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    web_server: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    ip: Mapped[IP] = relationship(back_populates="web_techs")
+    endpoints: Mapped[list["Endpoint"]] = relationship(
+        back_populates="web_tech", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class Endpoint(Base):
+    """One crawled URL found by katana on a web property."""
+
+    __tablename__ = "endpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    web_tech_id: Mapped[int] = mapped_column(
+        ForeignKey("web_techs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    method: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="GET"
+    )
+    source: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    web_tech: Mapped[WebTech] = relationship(back_populates="endpoints")

@@ -29,6 +29,7 @@ class IPCreate(BaseModel):
     provider: str | None = None
     os: str | None = None
     scripts_info: dict[str, str] | None = None
+    has_anonymous_access: bool = False
     traceroute: list[dict[str, object]] | None = None
     last_scan: datetime | None = None
 
@@ -70,8 +71,37 @@ class IPDetailsResponse(BaseModel):
     os: str | None = None
     provider: str | None = None
     scripts_info: dict[str, str] = Field(default_factory=dict)
+    has_anonymous_access: bool = False
     traceroute: list[dict[str, object]] = Field(default_factory=list)
     ports: list[PortDetailsResponse] = Field(default_factory=list)
+    web_techs: list["WebTechResponse"] = Field(default_factory=list)
+
+
+class EndpointResponse(BaseModel):
+    """A crawled URL discovered on a web property."""
+
+    id: int
+    path: str
+    method: str
+    source: str | None = None
+    discovered_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WebTechResponse(BaseModel):
+    """A live web property discovered by httpx, with its crawled endpoints."""
+
+    id: int
+    url: str
+    status_code: int | None = None
+    title: str | None = None
+    technologies: list[str] = Field(default_factory=list)
+    web_server: str | None = None
+    discovered_at: datetime
+    endpoints: list[EndpointResponse] = Field(default_factory=list)
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class LinkCreate(BaseModel):

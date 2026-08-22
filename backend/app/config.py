@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     AMASS_CONF_PATH: str = "/root/.config/amass/config.yaml"
     AMASS_WORDLIST_PATH: str = "/usr/share/wordlists/amass/subdomains-top1mil-5000.txt"
     ALLOW_ACTIVE_RECON: bool = False
+    ALLOW_WAF_BYPASS: bool = False
+    WAF_BYPASS_RATE_LIMIT: int = 150
+    WAF_BYPASS_CONCURRENCY: int = 30
 
     model_config = SettingsConfigDict(env_file=PROJECT_ROOT / ".env", extra="ignore")
 

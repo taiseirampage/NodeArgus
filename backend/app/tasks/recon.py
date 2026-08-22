@@ -14,6 +14,7 @@ from app.scanner.subfinder_wrapper import SubfinderError, run_subfinder
 from app.scanner.validator import validate_domain
 
 from app.tasks.scan import _run_async
+from app.tasks.web_recon import run_web_recon_task
 
 
 logger = logging.getLogger(__name__)
@@ -409,5 +410,16 @@ def run_unified_recon_task(
         )
     else:
         summary["status"] = "success"
+    try:
+        run_web_recon_task.delay(domain)
+        logger.info(
+            "Dispatched web recon (httpx/katana) for %s after recon phase", domain
+        )
+        summary["web_recon_dispatched"] = True
+    except Exception as error:
+        logger.warning(
+            "Unable to enqueue web recon after recon for %s: %s", domain, error
+        )
+        summary["web_recon_dispatched"] = False
     logger.info("Unified recon finished for %s: %s", domain, summary)
     return summary
