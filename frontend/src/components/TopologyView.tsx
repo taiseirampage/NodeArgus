@@ -3,9 +3,9 @@ import { NetworkGraph, type GraphNode } from './NetworkGraph'
 import { TaskStatus } from './TaskStatus'
 
 interface TopologyViewProps {
-  scanTask: { id: string; targetIp: string } | null
+  scanTask: { taskIds: string[]; targets: string[] } | null
   scannedIps: string[]
-  onGraphReady: (targetIp: string) => void
+  onGraphReady: (targets: string[]) => void
   onNodeClick: (node: GraphNode) => void
   onClearGraph: () => void
 }
@@ -19,7 +19,7 @@ export function TopologyView({
 }: TopologyViewProps): ReactElement {
   const latestScannedIp = scannedIps[scannedIps.length - 1] ?? null
   const handleGraphReady = useCallback(
-    (targetIp: string): void => onGraphReady(targetIp),
+    (targets: string[]): void => onGraphReady(targets),
     [onGraphReady],
   )
 
@@ -66,8 +66,8 @@ export function TopologyView({
           </div>
 
           <TaskStatus
-            taskId={scanTask?.id ?? null}
-            targetIp={scanTask?.targetIp ?? null}
+            taskIds={scanTask?.taskIds ?? []}
+            targets={scanTask?.targets ?? []}
             onSuccess={handleGraphReady}
           />
         </section>

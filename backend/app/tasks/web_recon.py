@@ -8,8 +8,10 @@ from urllib.parse import urlsplit
 from celery import Task
 
 from app.celery_worker import celery_app
+from app.config import settings
 from app.db import crud
 from app.db.database import AsyncSessionLocal
+from app.geo.geoip import GeoIPService, open_geo_service
 from app.scanner.httpx_wrapper import HttpxError, run_httpx
 from app.scanner.katana_wrapper import KatanaError, run_katana
 from app.scanner.validator import validate_domain
@@ -71,12 +73,17 @@ async def _targets_for_domain(db: Any, domain: str) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-async def _resolve_host_ip_id(db: Any, host: str) -> int | None:
+async def _resolve_host_ip_id(
+    db: Any,
+    host: str,
+    geo_service: GeoIPService | None = None,
+) -> int | None:
     """Map a URL host to an IP record id, using DB data then DNS fallback."""
     host = host.rstrip(".")
     try:
         ip = str(ipaddress.ip_address(host))
-        return await crud.get_or_create_ip_id(db, ip)
+        location = geo_service.lookup(ip) if geo_service is not None else None
+        return await crud.get_or_create_ip_id(db, ip, location)
     except ValueError:
         pass
 
@@ -94,7 +101,8 @@ async def _resolve_host_ip_id(db: Any, host: str) -> int | None:
     if not infos:
         return None
     resolved_ip = str(infos[0][4][0])
-    return await crud.get_or_create_ip_id(db, resolved_ip)
+    location = geo_service.lookup(resolved_ip) if geo_service is not None else None
+    return await crud.get_or_create_ip_id(db, resolved_ip, location)
 
 
 async def _run_web_recon(
@@ -122,6 +130,28 @@ async def _run_web_recon(
     else:
         domain = validate_domain(target)
 
+    geo_service = open_geo_service(settings.GEOIP_DB_PATH)
+    try:
+        return await _run_web_recon_with_db(
+            target,
+            ip,
+            domain,
+            max_endpoints_per_host,
+            geo_service,
+        )
+    finally:
+        if geo_service is not None:
+            geo_service.close()
+
+
+async def _run_web_recon_with_db(
+    target: str,
+    ip: str | None,
+    domain: str | None,
+    max_endpoints_per_host: int,
+    geo_service: GeoIPService | None,
+) -> dict[str, Any]:
+    """Shared web-recon body: maps targets, probes, crawls, and persists."""
     async with AsyncSessionLocal() as db:
         if ip is not None:
             targets = await _targets_for_ip(db, ip)
@@ -167,7 +197,7 @@ async def _run_web_recon(
             if not isinstance(url, str) or not url.strip():
                 continue
             origin, host = _origin_and_host(url)
-            ip_id = await _resolve_host_ip_id(db, host)
+            ip_id = await _resolve_host_ip_id(db, host, geo_service)
             if ip_id is None:
                 logger.warning("Unable to map web host %s to an IP; skipping", host)
                 continue

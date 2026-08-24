@@ -8,8 +8,10 @@ from typing import Any
 from celery import Task, group
 
 from app.celery_worker import celery_app
+from app.config import settings
 from app.db import crud
 from app.db.database import AsyncSessionLocal
+from app.geo.geoip import GeoIPService, open_geo_service
 from app.scanner.subfinder_wrapper import SubfinderError, run_subfinder
 from app.scanner.validator import validate_domain
 
@@ -110,8 +112,15 @@ async def _run_recon(target: str) -> dict[str, Any]:
         return {"domain": domain, "subdomains": 0, "links": 0}
 
     enriched = await _enrich_with_ips(subfinder_records)
-    async with AsyncSessionLocal() as db:
-        saved_counts = await crud.save_recon_results(db, domain, enriched)
+    geo_service = open_geo_service(settings.GEOIP_DB_PATH)
+    try:
+        async with AsyncSessionLocal() as db:
+            saved_counts = await crud.save_recon_results(
+                db, domain, enriched, geo_service
+            )
+    finally:
+        if geo_service is not None:
+            geo_service.close()
     counts: dict[str, Any] = {
         "domains": saved_counts["domains"],
         "subdomains": saved_counts["subdomains"],
@@ -284,8 +293,15 @@ async def _persist_unified_recon(
         amass_ips = {str(ip) for ip in raw_ips if isinstance(ip, str)}
 
     enriched = await _unified_resolve(merged, amass_resolved)
-    async with AsyncSessionLocal() as db:
-        counts = await crud.save_unified_recon_results(db, domain, enriched, asn_info)
+    geo_service = open_geo_service(settings.GEOIP_DB_PATH)
+    try:
+        async with AsyncSessionLocal() as db:
+            counts = await crud.save_unified_recon_results(
+                db, domain, enriched, asn_info, geo_service
+            )
+    finally:
+        if geo_service is not None:
+            geo_service.close()
 
     resolved_ips = {ip for record in enriched for ip in record.get("ip_addresses", [])}
     resolved_ips.update(amass_ips)

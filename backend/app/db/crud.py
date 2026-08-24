@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import ipaddress
 import logging
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -337,7 +337,10 @@ async def save_traceroute_hops(
 
 
 async def save_recon_results(
-    db: AsyncSession, domain_name: str, subdomains: list[dict[str, object]]
+    db: AsyncSession,
+    domain_name: str,
+    subdomains: list[dict[str, object]],
+    geo_service: GeoIPService | None = None,
 ) -> dict[str, int]:
     """Persist a root domain, its subdomains, and resolved IP links idempotently.
 
@@ -345,12 +348,14 @@ async def save_recon_results(
     may include ``source`` (the passive source that found it) and
     ``ip_addresses`` (a list of resolved A/AAAA records). Rows are inserted with
     PostgreSQL ``INSERT ... ON CONFLICT DO NOTHING`` so a re-run never
-    duplicates rows or links.
+    duplicates rows or links. When ``geo_service`` is provided, resolved IPs are
+    geolocated so recon hosts show up on the world map.
 
     Args:
         db: The active async session.
         domain_name: The validated root FQDN.
         subdomains: Discovered subdomain records with optional sources and IPs.
+        geo_service: Optional GeoIP reader used to attach coordinates to IPs.
 
     Returns:
         A dict summarizing counts of domains, subdomains, and links saved.
@@ -384,7 +389,7 @@ async def save_recon_results(
             except ValueError:
                 logger.warning("Ignoring invalid resolved IP for %s: %s", name, raw_ip)
                 continue
-            ip_id = await _upsert_ip(db, ip)
+            ip_id = await _upsert_ip(db, ip, _geo_for(geo_service, ip))
             if await _link_subdomain_ip(db, sub_id, ip_id):
                 saved_links += 1
 
@@ -438,15 +443,110 @@ async def _upsert_subdomain(
     return existing.scalar_one_or_none(), False
 
 
-async def _upsert_ip(db: AsyncSession, ip: str) -> Any:
-    """Return the id of an IP record, inserting a minimal row when new."""
+async def _upsert_ip(
+    db: AsyncSession, ip: str, location: GeoLocation | None = None
+) -> Any:
+    """Return the id of an IP record, inserting minimal rows when new.
+
+    When a ``location`` is supplied the GeoIP fields are attached to a newly
+    created row, or back-filled onto an existing row that has no coordinates yet
+    (e.g. an IP first seen during passive recon and now being geolocated). This
+    keeps recon-discovered hosts visible on the world map.
+    """
     record = await get_ip_by_address(db, ip)
     if record is not None:
+        if location is not None and (
+            record.latitude is None or record.longitude is None
+        ):
+            _apply_location(record, location)
+            await db.flush()
         return record.id
     created = IP(ip_address=ip)
+    if location is not None:
+        _apply_location(created, location)
     db.add(created)
     await db.flush()
     return created.id
+
+
+def _apply_location(record: IP, location: GeoLocation) -> None:
+    """Attach GeoIP fields to an IP record before it is flushed/committed."""
+    record.country = location.country
+    record.country_code = location.country_code
+    record.city = location.city
+    record.latitude = location.latitude
+    record.longitude = location.longitude
+    record.provider = location.isp
+
+
+def _geo_for(geo_service: GeoIPService | None, ip: str) -> GeoLocation | None:
+    """Return geolocation data for one IP when a GeoIP reader is active."""
+    if geo_service is None:
+        return None
+    return geo_service.lookup(ip)
+
+
+class GeoLookup(Protocol):
+    """Structural type for anything that can resolve an IP to geolocation."""
+
+    def lookup(self, ip: str) -> GeoLocation | None: ...
+
+
+async def backfill_ip_geolocation(
+    db: AsyncSession,
+    geo_service: GeoLookup | None,
+    attempted: set[str],
+) -> int:
+    """Geocode public IPs that still lack coordinates.
+
+    Older scans inserted minimal ``IP`` rows without GeoIP data (passive recon
+    especially). This walks every row with missing coordinates, strips the
+    ``/N`` mask PostgreSQL's ``inet`` type appends to ``str(ip_address)``,
+    skips private/reserved ranges, and fills in the location. Already-missed or
+    private hosts are recorded in ``attempted`` so repeated map refreshes do not
+    re-query the GeoIP database for the same addresses.
+
+    Args:
+        db: The active async session.
+        geo_service: An open GeoIP reader; no-op when None.
+        attempted: In-memory set of host strings already processed; mutated here.
+
+    Returns:
+        The number of IP rows updated with coordinates.
+    """
+    if geo_service is None:
+        return 0
+    rows = list(
+        (
+            await db.execute(
+                select(IP).where(IP.latitude.is_(None), IP.longitude.is_(None))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    updated = 0
+    for record in rows:
+        host = str(record.ip_address).split("/", maxsplit=1)[0]
+        if host in attempted:
+            continue
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            attempted.add(host)
+            continue
+        if address.is_private or address.is_loopback or address.is_reserved:
+            attempted.add(host)
+            continue
+        location = geo_service.lookup(host)
+        attempted.add(host)
+        if location is None:
+            continue
+        _apply_location(record, location)
+        updated += 1
+    if updated:
+        await db.commit()
+    return updated
 
 
 async def _link_subdomain_ip(db: AsyncSession, sub_id: Any, ip_id: Any) -> bool:
@@ -574,19 +674,22 @@ async def save_amass_results(
     db: AsyncSession,
     domain_name: str,
     amass_result: dict[str, Any],
+    geo_service: GeoIPService | None = None,
 ) -> dict[str, int]:
     """Persist Amass recon output (subdomains, IPs, ASN) idempotently.
 
     Subdomains are upserted with source merge so rows already created by
     Subfinder are updated to also list ``amass`` rather than being replaced.
     Domain-level ASN/CIDR attribution and per-ASN history rows are stored in the
-    ``domains`` and ``asn_info`` tables respectively.
+    ``domains`` and ``asn_info`` tables respectively. When ``geo_service`` is
+    provided, resolved IPs are geolocated so they appear on the world map.
 
     Args:
         db: The active async session.
         domain_name: The validated root FQDN.
         amass_result: Output of ``run_amass`` with ``subdomains``, ``asn_info``
             and ``ip_addresses`` keys.
+        geo_service: Optional GeoIP reader used to attach coordinates to IPs.
 
     Returns:
         A dict summarizing the number of subdomains, IP links, and ASN records
@@ -624,7 +727,7 @@ async def save_amass_results(
             except ValueError:
                 logger.warning("Ignoring invalid Amass IP: %s", raw_ip)
                 continue
-            ip_id = await _upsert_ip(db, ip)
+            ip_id = await _upsert_ip(db, ip, _geo_for(geo_service, ip))
             if await _link_subdomain_ip(db, sub_id, ip_id):
                 saved_links += 1
 
@@ -689,6 +792,7 @@ async def save_unified_recon_results(
     domain_name: str,
     subdomains: list[dict[str, Any]],
     asn_info: list[dict[str, Any]] | None = None,
+    geo_service: GeoIPService | None = None,
 ) -> dict[str, int]:
     """Persist de-duplicated multi-tool recon output in one pass.
 
@@ -696,13 +800,15 @@ async def save_unified_recon_results(
     ``name``, a list of ``sources`` (tool labels, e.g. ``["subfinder","amass"]``)
     and ``ip_addresses``. Subdomains already present from an earlier Subfinder or
     Amass run are updated to merge the new source labels, so no duplicates are
-    ever created and shared discoveries keep all provenance.
+    ever created and shared discoveries keep all provenance. When ``geo_service``
+    is provided, resolved IPs are geolocated so recon hosts appear on the map.
 
     Args:
         db: The active async session.
         domain_name: The validated root FQDN.
         subdomains: Unique subdomain records with merged source labels.
         asn_info: Optional ASN attribution records to merge onto the domain.
+        geo_service: Optional GeoIP reader used to attach coordinates to IPs.
 
     Returns:
         A dict with counts of subdomains, IP links, and ASN records saved.
@@ -744,7 +850,7 @@ async def save_unified_recon_results(
             except ValueError:
                 logger.warning("Ignoring invalid resolved IP for %s: %s", name, raw_ip)
                 continue
-            ip_id = await _upsert_ip(db, ip)
+            ip_id = await _upsert_ip(db, ip, _geo_for(geo_service, ip))
             if await _link_subdomain_ip(db, sub_id, ip_id):
                 saved_links += 1
 
@@ -813,9 +919,11 @@ async def get_ip_id_by_hostname(db: AsyncSession, hostname: str) -> Any | None:
     return result.scalar_one_or_none()
 
 
-async def get_or_create_ip_id(db: AsyncSession, ip: str) -> Any:
+async def get_or_create_ip_id(
+    db: AsyncSession, ip: str, location: GeoLocation | None = None
+) -> Any:
     """Return the id of an IP record, inserting a minimal row when new."""
-    return await _upsert_ip(db, ip)
+    return await _upsert_ip(db, ip, location)
 
 
 async def save_web_recon_result(

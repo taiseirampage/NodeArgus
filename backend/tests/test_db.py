@@ -238,3 +238,107 @@ async def test_save_scan_result_persists_anonymous_access_flag(
     record = await crud.save_scan_result(db_session, result, GeoLocation(ip="8.8.8.8"))
 
     assert record.has_anonymous_access is True
+
+
+@pytest.mark.asyncio
+async def test_upsert_ip_applies_geo_location(db_session: AsyncSession) -> None:
+    location = GeoLocation(
+        ip="8.8.8.8",
+        country="United States",
+        country_code="US",
+        city="Mountain View",
+        latitude=37.751,
+        longitude=-97.822,
+        isp="Example ISP",
+    )
+
+    await crud._upsert_ip(db_session, "8.8.8.8", location)
+    record = await crud.get_ip_by_address(db_session, "8.8.8.8")
+
+    assert record is not None
+    assert record.latitude == 37.751
+    assert record.longitude == -97.822
+    assert record.country_code == "US"
+    assert record.provider == "Example ISP"
+
+
+@pytest.mark.asyncio
+async def test_upsert_ip_backfills_missing_geo(db_session: AsyncSession) -> None:
+    await crud._upsert_ip(db_session, "1.1.1.1")
+    before = await crud.get_ip_by_address(db_session, "1.1.1.1")
+    assert before is not None
+    assert before.latitude is None
+
+    await crud._upsert_ip(
+        db_session, "1.1.1.1", GeoLocation(ip="1.1.1.1", latitude=1.0, longitude=-1.0)
+    )
+    after = await crud.get_ip_by_address(db_session, "1.1.1.1")
+
+    assert after is not None
+    assert after.latitude == 1.0
+    assert after.longitude == -1.0
+
+
+@pytest.mark.asyncio
+async def test_upsert_ip_keeps_existing_geo(db_session: AsyncSession) -> None:
+    await crud._upsert_ip(
+        db_session, "4.4.4.4", GeoLocation(ip="4.4.4.4", latitude=40.0, longitude=-74.0)
+    )
+    await crud._upsert_ip(
+        db_session, "4.4.4.4", GeoLocation(ip="4.4.4.4", latitude=1.0, longitude=1.0)
+    )
+    record = await crud.get_ip_by_address(db_session, "4.4.4.4")
+
+    assert record is not None
+    assert record.latitude == 40.0
+    assert record.longitude == -74.0
+
+
+class _StubGeoService:
+    def __init__(self, mapping: dict[str, GeoLocation]) -> None:
+        self._mapping = mapping
+        self.calls: list[str] = []
+
+    def lookup(self, ip: str) -> GeoLocation | None:
+        self.calls.append(ip)
+        return self._mapping.get(ip)
+
+
+@pytest.mark.asyncio
+async def test_backfill_ip_geolocation_geocodes_public_ips(
+    db_session: AsyncSession,
+) -> None:
+    await crud._upsert_ip(db_session, "104.20.2.108")
+    await crud._upsert_ip(db_session, "10.0.0.5")
+    geo = _StubGeoService(
+        {
+            "104.20.2.108": GeoLocation(
+                ip="104.20.2.108",
+                country="US",
+                country_code="US",
+                city="Unknown",
+                latitude=0.0,
+                longitude=0.0,
+            )
+        }
+    )
+    attempted: set[str] = set()
+
+    updated = await crud.backfill_ip_geolocation(db_session, geo, attempted)
+
+    assert updated == 1
+    public = await crud.get_ip_by_address(db_session, "104.20.2.108")
+    assert public is not None
+    assert public.latitude == 0.0
+    assert public.longitude == 0.0
+    assert public.country_code == "US"
+
+    private = await crud.get_ip_by_address(db_session, "10.0.0.5")
+    assert private is not None
+    assert private.latitude is None
+    assert private.longitude is None
+
+    # Private IPs and already-attempted hosts are not looked up again.
+    second = await crud.backfill_ip_geolocation(db_session, geo, attempted)
+    assert second == 0
+    assert geo.calls == ["104.20.2.108"]

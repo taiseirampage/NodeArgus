@@ -140,7 +140,12 @@ async def test_map_assets_endpoint_uses_cache_within_ttl() -> None:
             new_callable=AsyncMock,
             return_value=db_body,
         ) as crud_mock,
-        patch("app.api.v1.endpoints.map.time.monotonic", side_effect=[100.0, 100.0]),
+        patch(
+            "app.api.v1.endpoints.map.crud.backfill_ip_geolocation",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch("app.api.v1.endpoints.map.time.monotonic", return_value=100.0),
     ):
         first = await get_map_assets(db)
         second = await get_map_assets(db)
@@ -152,29 +157,68 @@ async def test_map_assets_endpoint_uses_cache_within_ttl() -> None:
 @pytest.mark.asyncio
 async def test_map_assets_endpoint_refreshes_after_ttl() -> None:
     db = AsyncMock()
+    crud_body = [
+        {
+            "ip": "198.51.100.12",
+            "latitude": 1.0,
+            "longitude": 2.0,
+            "ports_count": 0,
+            "max_severity": None,
+        }
+    ]
     with (
         patch(
             "app.api.v1.endpoints.map.crud.get_map_assets",
             new_callable=AsyncMock,
-            return_value=[
-                {
-                    "ip": "198.51.100.12",
-                    "latitude": 1.0,
-                    "longitude": 2.0,
-                    "ports_count": 0,
-                    "max_severity": None,
-                }
-            ],
+            return_value=crud_body,
         ) as crud_mock,
         patch(
-            "app.api.v1.endpoints.map.time.monotonic",
-            side_effect=[100.0, 100.0, 400.0],
+            "app.api.v1.endpoints.map.crud.backfill_ip_geolocation",
+            new_callable=AsyncMock,
+            return_value=0,
         ),
+        patch("app.api.v1.endpoints.map.time.monotonic", return_value=400.0),
     ):
         first = await get_map_assets(db)
         within_ttl = await get_map_assets(db)
-        after_ttl = await get_map_assets(db)
         assert first.count == 1
         assert within_ttl.count == 1
+        assert crud_mock.call_count == 1
+
+        # Simulate the cached entry becoming older than CACHE_TTL_SECONDS.
+        map_endpoint._cache["at"] = 100.0
+        after_ttl = await get_map_assets(db)
         assert after_ttl.count == 1
+        assert crud_mock.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_map_assets_endpoint_bypasses_cache_when_refresh() -> None:
+    db = AsyncMock()
+    body = [
+        {
+            "ip": "198.51.100.13",
+            "latitude": 3.0,
+            "longitude": 4.0,
+            "ports_count": 0,
+            "max_severity": None,
+        }
+    ]
+    with (
+        patch(
+            "app.api.v1.endpoints.map.crud.get_map_assets",
+            new_callable=AsyncMock,
+            return_value=body,
+        ) as crud_mock,
+        patch(
+            "app.api.v1.endpoints.map.crud.backfill_ip_geolocation",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        patch("app.api.v1.endpoints.map.time.monotonic", return_value=100.0),
+    ):
+        first = await get_map_assets(db)
+        refreshed = await get_map_assets(db, refresh=True)
+        assert first.count == 1
+        assert refreshed.count == 1
         assert crud_mock.call_count == 2

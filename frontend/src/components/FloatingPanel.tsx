@@ -10,6 +10,8 @@ type AmassMode = 'passive' | 'active'
 
 interface ScanResponse {
   task_id: string
+  task_ids?: string[]
+  targets?: string[]
   status: string
   scan_type: ScanType
   recon_tools?: ReconTool[]
@@ -19,7 +21,7 @@ interface FloatingPanelProps {
   view: ViewMode
   onViewChange: (view: ViewMode) => void
   assetCount: number
-  onScanSubmitted: (taskId: string, targetIp: string) => void
+  onScanSubmitted: (taskIds: string[], targets: string[]) => void
   onSearch: (ip: string) => void
 }
 
@@ -82,10 +84,22 @@ export function FloatingPanel({
         body: JSON.stringify(payload),
       })
       const body = (await response.json()) as ScanResponse | { detail?: string }
-      if (!response.ok || !('task_id' in body)) {
-        throw new Error('detail' in body ? body.detail : 'Не удалось поставить задачу в очередь.')
+      if (!response.ok || !('task_ids' in body)) {
+        const message =
+          'detail' in body && typeof body.detail === 'string'
+            ? body.detail
+            : 'Не удалось поставить задачу в очередь.'
+        throw new Error(message)
       }
-      onScanSubmitted(body.task_id, normalizedTarget)
+      const taskIds =
+        Array.isArray(body.task_ids) && body.task_ids.length > 0
+          ? body.task_ids
+          : [body.task_id]
+      const submittedTargets =
+        Array.isArray(body.targets) && body.targets.length > 0
+          ? body.targets
+          : [normalizedTarget]
+      onScanSubmitted(taskIds, submittedTargets)
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Бэкенд недоступен.')
     } finally {
@@ -149,13 +163,16 @@ export function FloatingPanel({
               type="text"
               value={target}
               onChange={(event) => setTarget(event.target.value)}
-              placeholder="IP / CIDR / домен"
+              placeholder="IP, CIDR или домены: 10.0.0.1, example.com"
               autoComplete="off"
               spellCheck={false}
               disabled={isSubmitting}
               className="w-full bg-transparent py-2.5 font-mono text-xs text-white outline-none placeholder:text-slate-700"
             />
           </div>
+          <p className="mt-1 block font-mono text-[9px] leading-4 text-slate-600">
+            Списки пишутся через запятую: 192.168.1.0/24, example.com, hackthebox.com
+          </p>
         </div>
 
         <div>

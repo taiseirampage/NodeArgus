@@ -49,12 +49,14 @@ def test_run_recon_task_enriches_and_saves() -> None:
             return_value=counts,
         ) as save,
         patch("app.tasks.recon.AsyncSessionLocal", return_value=db),
+        patch("app.tasks.recon.open_geo_service", return_value=None) as geo,
     ):
         result = _execute_task("example.com")
 
     subfinder.assert_called_once_with("example.com")
     enrich.assert_called_once_with(subfinder_records)
-    save.assert_called_once_with(db, "example.com", enriched)
+    save.assert_called_once_with(db, "example.com", enriched, None)
+    geo.assert_called_once()
     assert result == {"domain": "example.com", **counts}
 
 

@@ -44,7 +44,7 @@ function mapAssetToSelectedNode(asset: MapAsset): SelectedNode {
 }
 
 function App(): ReactElement {
-  const [scanTask, setScanTask] = useState<{ id: string; targetIp: string } | null>(null)
+  const [scanTask, setScanTask] = useState<{ taskIds: string[]; targets: string[] } | null>(null)
   const [scannedIps, setScannedIps] = useState<string[]>(loadScannedIps)
   const [selectedNode, setSelectedNode] = useState<SelectedNode | null>(null)
   const [view, setView] = useState<ViewMode>(loadViewMode)
@@ -52,8 +52,8 @@ function App(): ReactElement {
   const [focusIp, setFocusIp] = useState<string | null>(null)
   const [mapRefreshKey, setMapRefreshKey] = useState(0)
 
-  const handleGraphReady = useCallback((targetIp: string): void => {
-    setScannedIps((currentIps) => [...currentIps.filter((ip) => ip !== targetIp), targetIp])
+  const handleGraphReady = useCallback((targets: string[]): void => {
+    setScannedIps((currentIps) => [...currentIps.filter((ip) => !targets.includes(ip)), ...targets])
     setMapRefreshKey((current) => current + 1)
   }, [])
 
@@ -135,15 +135,15 @@ function App(): ReactElement {
         view={view}
         onViewChange={handleViewChange}
         assetCount={assetCount}
-        onScanSubmitted={(id, targetIp) => setScanTask({ id, targetIp })}
+        onScanSubmitted={(taskIds, targets) => setScanTask({ taskIds, targets })}
         onSearch={handleSearch}
       />
 
       {view === 'map' && scanTask && (
         <div className="absolute right-4 top-16 z-[900] w-80 max-w-[calc(100vw-3rem)]">
           <TaskStatus
-            taskId={scanTask.id}
-            targetIp={scanTask.targetIp}
+            taskIds={scanTask.taskIds}
+            targets={scanTask.targets}
             onSuccess={handleGraphReady}
           />
         </div>

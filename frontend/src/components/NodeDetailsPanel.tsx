@@ -62,7 +62,7 @@ export interface Vulnerability {
 
 export interface SelectedNode {
   id: string
-  node_type: 'ip' | 'domain' | 'subdomain' | 'asn'
+  node_type: 'ip' | 'domain' | 'subdomain' | 'asn' | 'network'
   source: string | null
   resolved_ips: string[]
   country: string | null

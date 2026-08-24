@@ -4,8 +4,10 @@ from typing import Any, Literal
 from celery import Task
 
 from app.celery_worker import celery_app
+from app.config import settings
 from app.db import crud
 from app.db.database import AsyncSessionLocal
+from app.geo.geoip import open_geo_service
 from app.scanner.amass_wrapper import AmassError, run_amass
 from app.scanner.validator import validate_domain
 
@@ -31,8 +33,13 @@ async def _run_amass_recon(
             "ip_links": 0,
         }
 
-    async with AsyncSessionLocal() as db:
-        counts = await crud.save_amass_results(db, domain, result)
+    geo_service = open_geo_service(settings.GEOIP_DB_PATH)
+    try:
+        async with AsyncSessionLocal() as db:
+            counts = await crud.save_amass_results(db, domain, result, geo_service)
+    finally:
+        if geo_service is not None:
+            geo_service.close()
 
     summary: dict[str, Any] = {
         "domain": domain,

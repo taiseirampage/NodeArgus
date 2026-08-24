@@ -8,13 +8,14 @@ class GraphNode(BaseModel):
 
     id: str
     ip: str
-    node_type: Literal["ip", "domain", "subdomain", "asn"] = "ip"
+    node_type: Literal["ip", "domain", "subdomain", "asn", "network"] = "ip"
     source: str | None = None
     resolved_ips: list[str] = []
     country: str | None = None
     city: str | None = None
     os: str | None = None
     ports_count: int
+    member_count: int | None = None
     is_traceroute_hop: bool = False
     traceroute_hop: int | None = None
     traceroute_rtt: str | None = None

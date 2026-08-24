@@ -161,6 +161,70 @@ async def test_graph_accepts_cidr_target(db_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_graph_collapses_dense_subnet_into_network_hub(
+    db_session: AsyncSession,
+) -> None:
+    ips = [f"192.168.50.{index}" for index in range(1, 12)]
+    for address in ips:
+        await add_ip(db_session, address)
+    await db_session.commit()
+
+    response = await compute_graph(db_session, "192.168.50.1")
+
+    hub_nodes = [node for node in response.nodes if node.node_type == "network"]
+    assert len(hub_nodes) == 1
+    hub = hub_nodes[0]
+    assert hub.id == "net:192.168.50.0/24"
+    assert hub.member_count == 11
+
+    in_subnet = [link for link in response.links if link.type == "in_subnet"]
+    same_subnet = [link for link in response.links if link.type == "same_subnet"]
+    assert len(in_subnet) == 11
+    assert same_subnet == []
+    connected_ips = {
+        endpoint
+        for link in in_subnet
+        for endpoint in (link.source, link.target)
+        if endpoint != hub.id
+    }
+    assert connected_ips == set(ips)
+
+
+@pytest.mark.asyncio
+async def test_graph_keeps_mesh_for_small_subnet(
+    db_session: AsyncSession,
+) -> None:
+    ips = ["192.168.60.10", "192.168.60.20", "192.168.60.30"]
+    for address in ips:
+        await add_ip(db_session, address)
+    await db_session.commit()
+
+    response = await compute_graph(db_session, "192.168.60.0/24")
+
+    assert [node for node in response.nodes if node.node_type == "network"] == []
+    assert {link.type for link in response.links} == {"same_subnet"}
+    assert len(response.links) == 3
+
+
+@pytest.mark.asyncio
+async def test_graph_cidr_target_uses_hub_above_threshold(
+    db_session: AsyncSession,
+) -> None:
+    for address in [f"10.20.30.{index}" for index in range(1, 12)]:
+        await add_ip(db_session, address)
+    await db_session.commit()
+
+    response = await compute_graph(db_session, "10.20.30.0/24")
+
+    hub_nodes = [node for node in response.nodes if node.node_type == "network"]
+    assert len(hub_nodes) == 1
+    assert hub_nodes[0].id == "net:10.20.30.0/24"
+    in_subnet = [link for link in response.links if link.type == "in_subnet"]
+    assert len(in_subnet) == 11
+    assert [link for link in response.links if link.type == "same_subnet"] == []
+
+
+@pytest.mark.asyncio
 async def test_graph_includes_traceroute_chain_and_hop_metadata(
     db_session: AsyncSession,
 ) -> None:

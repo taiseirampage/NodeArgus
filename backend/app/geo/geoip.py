@@ -11,6 +11,26 @@ from .models import GeoLocation
 logger = logging.getLogger(__name__)
 
 
+def open_geo_service(db_path: str = "data/GeoLite2-City.mmdb") -> "GeoIPService | None":
+    """Open a GeoIP reader if available, or return None when it is not.
+
+    Recon, active-scan, and web-recon tasks call this so discovered IPs are
+    geolocated onto the world map without failing the whole scan when a local
+    MaxMind City database is missing or misconfigured.
+
+    Args:
+        db_path: Path to the local GeoLite2-City/GeoIP2-City database.
+
+    Returns:
+        An open GeoIPService, or None when the database cannot be loaded.
+    """
+    try:
+        return GeoIPService(db_path)
+    except (FileNotFoundError, RuntimeError) as error:
+        logger.warning("GeoIP unavailable; IPs will not be geolocated: %s", error)
+        return None
+
+
 class GeoIPService:
     """Look up IP geolocation data in a local MaxMind City database."""
 

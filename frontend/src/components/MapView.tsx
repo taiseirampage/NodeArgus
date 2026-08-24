@@ -112,7 +112,8 @@ export function MapView({
   useEffect(() => {
     const loadAssets = async (_signal: AbortSignal): Promise<void> => {
       try {
-        const response = await fetch(`${API_BASE_URL}/map/assets`, {
+        const cacheBuster = refreshKey > 0 ? '?refresh=1' : ''
+        const response = await fetch(`${API_BASE_URL}/map/assets${cacheBuster}`, {
           signal: _signal,
         })
         if (!response.ok) {

@@ -14,6 +14,16 @@ from app.scanner.models import MasscanResult, NmapResult, ScannedPort
 from app.tasks import _run_async, run_scan_task
 
 
+class _FakeGroupResult:
+    """Minimal Celery ``GroupResult`` stand-in for endpoint dispatch tests."""
+
+    def __init__(self, task_ids: list[str]) -> None:
+        self.results = [SimpleNamespace(id=task_id) for task_id in task_ids]
+
+    def apply_async(self) -> "_FakeGroupResult":
+        return self
+
+
 @pytest.mark.asyncio
 async def test_scan_endpoint_enqueues_task() -> None:
     task = SimpleNamespace(id="celery-task-123")
@@ -24,6 +34,8 @@ async def test_scan_endpoint_enqueues_task() -> None:
     task_proxy.delay.assert_called_once_with("192.168.1.1")
     assert response.model_dump() == {
         "task_id": "celery-task-123",
+        "task_ids": ["celery-task-123"],
+        "targets": ["192.168.1.1"],
         "status": "queued",
         "scan_type": "active",
         "recon_tools": [],
@@ -31,17 +43,35 @@ async def test_scan_endpoint_enqueues_task() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scan_endpoint_dispatches_recon_task() -> None:
-    task = SimpleNamespace(id="recon-task-1")
-    with patch("app.api.v1.endpoints.scan.run_unified_recon_task") as task_proxy:
+async def test_scan_endpoint_enqueues_ip_list_as_one_active_task() -> None:
+    task = SimpleNamespace(id="celery-task-456")
+    with patch("app.api.v1.endpoints.scan.run_scan_task") as task_proxy:
         task_proxy.delay.return_value = task
+        response = await create_scan(
+            ScanRequest(target="192.168.1.1, 192.168.1.20/24", scan_type="active")
+        )
+
+    task_proxy.delay.assert_called_once_with("192.168.1.1,192.168.1.0/24")
+    assert response.targets == ["192.168.1.1", "192.168.1.0/24"]
+
+
+@pytest.mark.asyncio
+async def test_scan_endpoint_dispatches_recon_task() -> None:
+    fake_group = _FakeGroupResult(["recon-task-1"])
+    with patch(
+        "app.api.v1.endpoints.scan.group", return_value=fake_group
+    ) as group_builder:
         response = await create_scan(
             ScanRequest(target="Example.COM", scan_type="recon")
         )
 
-    task_proxy.delay.assert_called_once_with("example.com", ["subfinder"], "passive")
+    workflow = group_builder.call_args.args[0]
+    assert len(workflow) == 1
+    assert workflow[0].args == ("example.com", ["subfinder"], "passive")
     assert response.model_dump() == {
         "task_id": "recon-task-1",
+        "task_ids": ["recon-task-1"],
+        "targets": ["example.com"],
         "status": "queued",
         "scan_type": "recon",
         "recon_tools": ["subfinder"],
@@ -50,9 +80,10 @@ async def test_scan_endpoint_dispatches_recon_task() -> None:
 
 @pytest.mark.asyncio
 async def test_scan_endpoint_dispatches_unified_recon_with_tools() -> None:
-    task = SimpleNamespace(id="unified-task-1")
-    with patch("app.api.v1.endpoints.scan.run_unified_recon_task") as task_proxy:
-        task_proxy.delay.return_value = task
+    fake_group = _FakeGroupResult(["unified-task-1"])
+    with patch(
+        "app.api.v1.endpoints.scan.group", return_value=fake_group
+    ) as group_builder:
         response = await create_scan(
             ScanRequest(
                 target="Example.COM",
@@ -62,17 +93,17 @@ async def test_scan_endpoint_dispatches_unified_recon_with_tools() -> None:
             )
         )
 
-    task_proxy.delay.assert_called_once_with(
-        "example.com", ["subfinder", "amass"], "active"
-    )
-    assert response.model_dump()["task_id"] == "unified-task-1"
+    workflow = group_builder.call_args.args[0]
+    assert workflow[0].args == ("example.com", ["subfinder", "amass"], "active")
+    assert response.task_id == "unified-task-1"
 
 
 @pytest.mark.asyncio
 async def test_scan_endpoint_dispatches_full_scan_task() -> None:
-    task = SimpleNamespace(id="full-task-1")
-    with patch("app.api.v1.endpoints.scan.run_full_scan_task") as task_proxy:
-        task_proxy.delay.return_value = task
+    fake_group = _FakeGroupResult(["full-task-1"])
+    with patch(
+        "app.api.v1.endpoints.scan.group", return_value=fake_group
+    ) as group_builder:
         response = await create_scan(
             ScanRequest(
                 target="hackthebox.com",
@@ -81,11 +112,12 @@ async def test_scan_endpoint_dispatches_full_scan_task() -> None:
             )
         )
 
-    task_proxy.delay.assert_called_once_with(
-        "hackthebox.com", ["subfinder", "amass"], "passive"
-    )
+    workflow = group_builder.call_args.args[0]
+    assert workflow[0].args == ("hackthebox.com", ["subfinder", "amass"], "passive")
     assert response.model_dump() == {
         "task_id": "full-task-1",
+        "task_ids": ["full-task-1"],
+        "targets": ["hackthebox.com"],
         "status": "queued",
         "scan_type": "full",
         "recon_tools": ["subfinder", "amass"],
@@ -94,25 +126,70 @@ async def test_scan_endpoint_dispatches_full_scan_task() -> None:
 
 @pytest.mark.asyncio
 async def test_scan_endpoint_dispatches_amass_task() -> None:
-    task = SimpleNamespace(id="amass-task-1")
-    with patch("app.api.v1.endpoints.scan.run_amass_task") as task_proxy:
-        task_proxy.delay.return_value = task
+    fake_group = _FakeGroupResult(["amass-task-1"])
+    with patch(
+        "app.api.v1.endpoints.scan.group", return_value=fake_group
+    ) as group_builder:
         response = await create_scan(
             ScanRequest(target="Example.COM", scan_type="amass", amass_mode="active")
         )
 
-    task_proxy.delay.assert_called_once_with("example.com", "active")
+    workflow = group_builder.call_args.args[0]
+    assert workflow[0].args == ("example.com", "active")
     assert response.model_dump() == {
         "task_id": "amass-task-1",
+        "task_ids": ["amass-task-1"],
+        "targets": ["example.com"],
         "status": "queued",
         "scan_type": "amass",
         "recon_tools": ["amass"],
     }
 
 
+@pytest.mark.asyncio
+async def test_scan_endpoint_dispatches_multi_domain_recon_as_group() -> None:
+    fake_group = _FakeGroupResult(["task-a", "task-b"])
+    with patch(
+        "app.api.v1.endpoints.scan.group", return_value=fake_group
+    ) as group_builder:
+        response = await create_scan(
+            ScanRequest(target="example.com, hackthebox.com", scan_type="recon")
+        )
+
+    workflow = group_builder.call_args.args[0]
+    assert len(workflow) == 2
+    assert workflow[0].args == ("example.com", ["subfinder"], "passive")
+    assert workflow[1].args == ("hackthebox.com", ["subfinder"], "passive")
+    assert response.task_ids == ["task-a", "task-b"]
+    assert response.targets == ["example.com", "hackthebox.com"]
+    assert response.task_id == "task-a"
+
+
 def test_scan_request_rejects_injectable_domain_for_recon() -> None:
     with pytest.raises(ValueError):
         ScanRequest(target="example.com; rm -rf /", scan_type="recon")
+
+
+def test_scan_request_split_targets_into_domains() -> None:
+    request = ScanRequest(target=" Example.com , hackthebox.com,", scan_type="recon")
+    assert request.get_targets() == ["example.com", "hackthebox.com"]
+
+
+def test_scan_request_fail_fast_names_invalid_domain() -> None:
+    with pytest.raises(ValueError, match="bad domain"):
+        ScanRequest(
+            target="example.com, bad domain!, hackthebox.com", scan_type="recon"
+        )
+
+
+def test_scan_request_split_targets_into_ips() -> None:
+    request = ScanRequest(target="192.168.1.1, 192.168.1.5/24", scan_type="active")
+    assert request.get_targets() == ["192.168.1.1", "192.168.1.0/24"]
+
+
+def test_scan_request_rejects_empty_target_list() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        ScanRequest(target=" , ", scan_type="recon")
 
 
 def test_scan_request_rejects_injectable_ip_for_active() -> None:

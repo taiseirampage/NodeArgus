@@ -24,18 +24,27 @@ interface ScanStatusResponse {
 }
 
 interface TaskStatusProps {
-  taskId: string | null
-  targetIp: string | null
-  onSuccess: (targetIp: string) => void
+  taskIds: string[]
+  targets: string[]
+  onSuccess: (targets: string[]) => void
 }
 
-export function TaskStatus({ taskId, targetIp, onSuccess }: TaskStatusProps) {
-  const [status, setStatus] = useState<ScanStatusResponse | null>(null)
+function resultMetric(result: TaskResult | null | undefined): string | null {
+  if (!result) return null
+  if (typeof result.total_subdomains === 'number') return `${result.total_subdomains} поддоменов`
+  if (typeof result.subdomains_found === 'number') return `${result.subdomains_found} поддоменов`
+  if (typeof result.subdomains === 'number') return `${result.subdomains} поддоменов`
+  if (typeof result.ports_found === 'number') return `${result.ports_found} портов`
+  return null
+}
+
+export function TaskStatus({ taskIds, targets, onSuccess }: TaskStatusProps) {
+  const [statuses, setStatuses] = useState<Record<string, ScanStatusResponse>>({})
   const [requestError, setRequestError] = useState<string | null>(null)
 
   useEffect(() => {
-    if (!taskId) {
-      setStatus(null)
+    if (taskIds.length === 0) {
+      setStatuses({})
       setRequestError(null)
       return
     }
@@ -49,38 +58,62 @@ export function TaskStatus({ taskId, targetIp, onSuccess }: TaskStatusProps) {
       }
     }
 
-    const pollStatus = async (): Promise<void> => {
+    const pollAll = async (): Promise<void> => {
       try {
-        const response = await fetch(`${API_BASE_URL}/scan/${encodeURIComponent(taskId)}/status`)
-        if (!response.ok) {
-          throw new Error(`Ошибка статуса: HTTP ${response.status}`)
-        }
-        const nextStatus = (await response.json()) as ScanStatusResponse
+        const settled = await Promise.allSettled(
+          taskIds.map(
+            async (id): Promise<{ id: string; status: ScanStatusResponse }> => {
+              const response = await fetch(
+                `${API_BASE_URL}/scan/${encodeURIComponent(id)}/status`,
+              )
+              if (!response.ok) {
+                throw new Error(`Ошибка статуса: HTTP ${response.status}`)
+              }
+              return { id, status: (await response.json()) as ScanStatusResponse }
+            },
+          ),
+        )
         if (!isMounted) return
-        setStatus(nextStatus)
-        setRequestError(null)
-        if (nextStatus.status === 'success' || nextStatus.status === 'failed') {
-          stopPolling()
+
+        const nextMap: Record<string, ScanStatusResponse> = {}
+        let hadFailure = false
+        for (const outcome of settled) {
+          if (outcome.status === 'fulfilled') {
+            nextMap[outcome.value.id] = outcome.value.status
+          } else {
+            hadFailure = true
+          }
         }
-        if (nextStatus.status === 'success' && targetIp) {
-          onSuccess(targetIp)
+        setStatuses(nextMap)
+        setRequestError(hadFailure ? 'Не удалось получить статус всех задач.' : null)
+
+        const allDone = taskIds.every((id) => {
+          const current = nextMap[id]
+          return current?.status === 'success' || current?.status === 'failed'
+        })
+        if (allDone) {
+          stopPolling()
+          const anyFailed = taskIds.some((id) => nextMap[id]?.status === 'failed')
+          if (!anyFailed) {
+            onSuccess(targets)
+          }
         }
       } catch (error) {
         if (!isMounted) return
-        setRequestError(error instanceof Error ? error.message : 'Не удалось получить статус задачи.')
+        setRequestError(error instanceof Error ? error.message : 'Не удалось получить статус задач.')
       }
     }
 
-    intervalId = window.setInterval(() => void pollStatus(), POLL_INTERVAL_MS)
-    void pollStatus()
+    intervalId = window.setInterval(() => void pollAll(), POLL_INTERVAL_MS)
+    void pollAll()
 
     return () => {
       isMounted = false
       stopPolling()
     }
-  }, [onSuccess, targetIp, taskId])
+  }, [onSuccess, targets, taskIds])
 
-  if (!taskId) {
+  if (taskIds.length === 0) {
     return (
       <aside className="panel-glow flex min-h-[20rem] flex-col justify-between rounded-3xl border border-dashed border-white/10 bg-slate-950/45 p-6 sm:p-8">
         <div>
@@ -96,14 +129,38 @@ export function TaskStatus({ taskId, targetIp, onSuccess }: TaskStatusProps) {
     )
   }
 
-  const isFinished = status?.status === 'success' || status?.status === 'failed'
-  const statusLabel = status?.status === 'success'
-    ? 'Операция завершена'
-    : status?.status === 'failed'
-      ? 'Операция остановлена'
-      : status?.status === 'processing'
-        ? 'Сканирование в процессе...'
-        : 'Ожидание...'
+  const terminal = (id: string): boolean => {
+    const current = statuses[id]
+    return current?.status === 'success' || current?.status === 'failed'
+  }
+  const anyFailed = taskIds.some((id) => statuses[id]?.status === 'failed')
+  const allDone = taskIds.every(terminal)
+  const allSuccess = allDone && !anyFailed
+  const doneCount = taskIds.filter(terminal).length
+
+  let statusLabel = 'Ожидание...'
+  let signalClass = 'animate-pulse bg-amber-300 shadow-[0_0_18px_#fcd34d]'
+  if (allSuccess) {
+    statusLabel = 'Операция завершена'
+    signalClass = 'bg-emerald-300'
+  } else if (allDone && anyFailed) {
+    statusLabel = 'Операция остановлена с ошибками'
+    signalClass = 'bg-rose-400'
+  } else if (anyFailed) {
+    statusLabel = 'Частично завершено (есть ошибки)'
+    signalClass = 'animate-pulse bg-rose-400 shadow-[0_0_18px_#fb7185]'
+  } else if (doneCount > 0) {
+    statusLabel = 'Сканирование в процессе...'
+  }
+
+  const firstError = taskIds
+    .map((id) => statuses[id]?.error)
+    .find((error): error is string => Boolean(error))
+
+  const firstProgress = taskIds
+    .map((id) => statuses[id])
+    .find((current) => current?.progress && Object.keys(current.progress).length > 0)
+    ?.progress
 
   return (
     <aside className="panel-glow min-h-[20rem] rounded-3xl border border-white/10 bg-slate-950/75 p-6 shadow-2xl shadow-black/20 backdrop-blur-xl sm:p-8">
@@ -112,54 +169,75 @@ export function TaskStatus({ taskId, targetIp, onSuccess }: TaskStatusProps) {
           <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-slate-500">02 / Live telemetry</p>
           <h2 className="mt-2 font-display text-2xl font-medium text-white">Task signal</h2>
         </div>
-        <span className={`mt-1 h-3 w-3 rounded-full ${isFinished ? 'bg-emerald-300' : 'animate-pulse bg-amber-300 shadow-[0_0_18px_#fcd34d]'}`} />
+        <span className={`mt-1 h-3 w-3 rounded-full ${signalClass}`} />
       </div>
 
       <div className="mt-10 rounded-2xl border border-white/10 bg-black/20 p-5">
-        <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-slate-600">Task ID</p>
-        <p className="mt-2 break-all font-mono text-xs leading-5 text-cyan-200">{taskId}</p>
+        <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-slate-600">
+          Task IDs // {taskIds.length}
+        </p>
+        <p className="mt-2 break-all font-mono text-xs leading-5 text-cyan-200">
+          {taskIds.join(', ')}
+        </p>
       </div>
 
       {requestError ? (
         <p className="mt-6 rounded-xl border border-rose-300/20 bg-rose-300/5 px-4 py-3 text-sm text-rose-200" role="alert">{requestError}</p>
-) : status?.status === 'success' ? (
-        status.result?.total_subdomains !== undefined || status.result?.subdomains !== undefined || status.result?.subdomains_found !== undefined ? (
-          <div className="mt-6 space-y-2">
-            <p className="text-lg text-emerald-200">
-              Успешно! Найдено поддоменов: {status.result?.total_subdomains ?? status.result?.subdomains ?? status.result?.subdomains_found ?? 0}
-            </p>
-            {(status.result?.unique_ips !== undefined || status.result?.tools_used !== undefined) && (
-              <div className="rounded-xl border border-gray-700 bg-gray-900/50 p-3 font-mono text-xs leading-5 text-gray-300">
-                {status.result?.unique_ips !== undefined && (
-                  <p>unique IP: <span className="text-cyan-300">{status.result.unique_ips}</span></p>
-                )}
-                {Array.isArray(status.result.tools_used) && status.result.tools_used.length > 0 && (
-                  <p className="mt-1">
-                    tools: {status.result.tools_used.map((tool) => (
-                      <span key={tool} className="ml-1 rounded-md bg-violet-400/10 px-2 py-0.5 uppercase text-violet-300">{tool}</span>
-                    ))}
-                  </p>
-                )}
-              </div>
-            )}
-            {status.result?.ips_to_scan !== undefined && (
-              <p className="text-sm text-emerald-200">Активных сканов: {status.result.ips_to_scan}</p>
-            )}
-          </div>
-        ) : (
-          <p className="mt-6 text-lg text-emerald-200">Успешно! Найдено портов: {status.result?.ports_found ?? 0}</p>
-        )
-    ) : status?.status === 'failed' ? (
-        <p className="mt-6 text-sm leading-6 text-rose-200">Ошибка: {status.error ?? 'Неизвестная ошибка'}</p>
+      ) : allSuccess ? (
+        <div className="mt-6 space-y-2">
+          <p className="text-lg text-emerald-200">Успешно! Завершено задач: {doneCount}</p>
+          <ul className="space-y-1.5">
+            {targets.map((target, index) => {
+              const id = taskIds[index]
+              const metric = resultMetric(id ? statuses[id]?.result : null)
+              return (
+                <li key={id ?? target} className="flex items-center justify-between gap-3 text-xs">
+                  <span className="font-mono text-gray-300">{target}</span>
+                  {metric && <span className="text-emerald-300">{metric}</span>}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
       ) : (
         <div className="mt-6 space-y-3">
           <div className="flex items-center gap-3 text-sm text-amber-100">
-            <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
+            <span className={`h-2 w-2 rounded-full ${allDone ? 'bg-rose-400' : 'animate-pulse bg-amber-300'}`} />
             {statusLabel}
           </div>
-          {status?.progress && Object.keys(status.progress).length > 0 && (
+
+          {firstError && (
+            <p className="text-sm leading-6 text-rose-200" role="alert">Ошибка: {firstError}</p>
+          )}
+
+          <ul className="space-y-2 rounded-xl border border-gray-700 bg-black/20 p-3">
+            {targets.map((target, index) => {
+              const id = taskIds[index]
+              const current = id ? statuses[id] : undefined
+              const done = current?.status === 'success'
+              const failed = current?.status === 'failed'
+              const metric = resultMetric(current?.result)
+              const label = failed ? 'Ошибка' : done ? 'Завершено' : 'В процессе...'
+              return (
+                <li key={id ?? `${target}-${index}`} className="flex items-center justify-between gap-3 text-xs">
+                  <span className="font-mono tracking-wider text-gray-300">{target}</span>
+                  <span className="flex items-center gap-2 font-mono">
+                    {!done && !failed && (
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-300" />
+                    )}
+                    <span className={failed ? 'text-rose-300' : done ? 'text-emerald-300' : 'text-amber-200'}>
+                      {label}
+                    </span>
+                    {metric && <span className="text-slate-400">· {metric}</span>}
+                  </span>
+                </li>
+              )
+            })}
+          </ul>
+
+          {firstProgress && (
             <ul className="space-y-2 rounded-xl border border-gray-700 bg-black/20 p-3">
-              {Object.entries(status.progress).map(([tool, state]) => (
+              {Object.entries(firstProgress).map(([tool, state]) => (
                 <li key={tool} className="flex items-center justify-between gap-3 text-xs">
                   <span className="font-mono uppercase tracking-wider text-gray-400">{tool}</span>
                   <span className={`flex items-center gap-2 font-mono ${
@@ -182,7 +260,7 @@ export function TaskStatus({ taskId, targetIp, onSuccess }: TaskStatusProps) {
       )}
 
       <div className="mt-10 border-t border-white/10 pt-4 font-mono text-[10px] uppercase tracking-[0.16em] text-slate-600">
-        {isFinished ? 'Polling stopped // terminal state' : 'Polling active // every 3 seconds'}
+        {allDone ? 'Polling stopped // terminal state' : 'Polling active // every 3 seconds'}
       </div>
     </aside>
   )

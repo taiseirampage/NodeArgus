@@ -16,6 +16,13 @@ from app.scanner.validator import validate_domain, validate_target
 
 from .models import GraphLink, GraphNode, GraphResponse
 
+# Number of IPs in one subnet above which the graph collapses the member
+# mesh into a single "network" hub node. Below this threshold a real
+# same_subnet mesh stays readable and is rendered as-is.
+SUBNET_HUB_THRESHOLD = 8
+
+IN_SUBNET_LINK_TYPE = "in_subnet"
+
 
 Selector = (
     ipaddress.IPv4Address
@@ -23,6 +30,10 @@ Selector = (
     | ipaddress.IPv4Network
     | ipaddress.IPv6Network
 )
+
+
+def _hub_id(subnet: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str:
+    return f"net:{subnet.network_address}/{subnet.prefixlen}"
 
 
 def _parse_selector(target: str) -> tuple[str, list[Selector]]:
@@ -170,12 +181,33 @@ def _node_from_record(record: IP, port_counts: dict[int, int]) -> GraphNode:
     )
 
 
-def _subnet_links(
+def _subnet_structure(
     selectors: list[Selector], selected: list[IP], candidates: list[IP]
-) -> list[GraphLink]:
+) -> tuple[list[GraphNode], list[GraphLink]]:
+    """Build subnet relationships, collapsing dense subnets into hubs.
+
+    For each selector the member IPs are grouped by their subnet. Groups with
+    more than ``SUBNET_HUB_THRESHOLD`` members are represented by a single
+    ``network`` hub node linked to every member with an ``in_subnet`` edge
+    (star, O(n) instead of the full O(n^2) mesh). Smaller groups keep the
+    original ``same_subnet`` mesh, which stays readable.
+
+    Subnet membership is computed on the fly and never written to the
+    ``links`` table.
+    """
+    hub_nodes: list[GraphNode] = []
     links: list[GraphLink] = []
     seen: set[tuple[str, str]] = set()
     selected_by_ip = {str(record.ip_address): record for record in selected}
+
+    def add_link(source: str, target: str, link_type: str) -> None:
+        ordered = sorted((source, target))
+        pair: tuple[str, str] = (ordered[0], ordered[1])
+        if pair in seen:
+            return
+        seen.add(pair)
+        links.append(GraphLink(source=pair[0], target=pair[1], type=link_type))
+
     for selector in selectors:
         if isinstance(selector, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
             membership_selector: Selector = ipaddress.ip_network(
@@ -187,30 +219,55 @@ def _subnet_links(
                 if _record_matches(record, membership_selector)
             ]
             anchor = selected_by_ip.get(str(selector))
-            pairs = (
-                (anchor, member)
-                for member in members
-                if anchor and member.id != anchor.id
-            )
+            if not anchor:
+                continue
+            if len(members) - 1 > SUBNET_HUB_THRESHOLD:
+                hub_id = _hub_id(membership_selector)
+                hub_nodes.append(
+                    GraphNode(
+                        id=hub_id,
+                        ip="",
+                        node_type="network",
+                        member_count=len(members),
+                        ports_count=0,
+                    )
+                )
+                add_link(hub_id, str(anchor.ip_address), IN_SUBNET_LINK_TYPE)
+                for member in members:
+                    if member.id != anchor.id:
+                        add_link(hub_id, str(member.ip_address), IN_SUBNET_LINK_TYPE)
+            else:
+                for member in members:
+                    if member.id != anchor.id:
+                        add_link(
+                            str(anchor.ip_address),
+                            str(member.ip_address),
+                            "same_subnet",
+                        )
         else:
             members = [
                 record for record in candidates if _record_matches(record, selector)
             ]
-            pairs = combinations(members, 2)
-        for source, target in pairs:
-            if source is None:
-                continue
-            source_ip, target_ip = sorted(
-                (str(source.ip_address), str(target.ip_address))
-            )
-            pair = (source_ip, target_ip)
-            if pair in seen:
-                continue
-            seen.add(pair)
-            links.append(
-                GraphLink(source=source_ip, target=target_ip, type="same_subnet")
-            )
-    return links
+            if len(members) > SUBNET_HUB_THRESHOLD:
+                hub_id = _hub_id(selector)
+                hub_nodes.append(
+                    GraphNode(
+                        id=hub_id,
+                        ip="",
+                        node_type="network",
+                        member_count=len(members),
+                        ports_count=0,
+                    )
+                )
+                for member in members:
+                    add_link(hub_id, str(member.ip_address), IN_SUBNET_LINK_TYPE)
+            else:
+                for source, target in combinations(members, 2):
+                    add_link(
+                        str(source.ip_address), str(target.ip_address), "same_subnet"
+                    )
+
+    return hub_nodes, links
 
 
 async def compute_graph(db: AsyncSession, target_ip: str) -> GraphResponse:
@@ -252,7 +309,9 @@ async def compute_graph(db: AsyncSession, target_ip: str) -> GraphResponse:
         _node_from_record(records_by_id[record_id], port_counts)
         for record_id in ordered_ids
     ]
-    links = _subnet_links(selectors, selected, candidates)
+    hub_nodes, subnet_links = _subnet_structure(selectors, selected, candidates)
+    nodes.extend(hub_nodes)
+    links = subnet_links
     links.extend(
         GraphLink(
             source=str(records_by_id[source_id].ip_address),

@@ -39,11 +39,13 @@ def test_run_amass_task_saves_and_returns_counts() -> None:
             return_value=counts,
         ) as save,
         patch("app.tasks.amass_recon.AsyncSessionLocal", return_value=db),
+        patch("app.tasks.amass_recon.open_geo_service", return_value=None) as geo,
     ):
         result = _execute_task("example.com", "passive")
 
     amass.assert_called_once_with("example.com", "passive")
-    save.assert_called_once_with(db, "example.com", amass_result)
+    save.assert_called_once_with(db, "example.com", amass_result, None)
+    geo.assert_called_once()
     assert result == {
         "domain": "example.com",
         "subdomains": 2,
