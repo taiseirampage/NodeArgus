@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, patch
 from app.db import crud
 from app.db.models import Base, Domain, IP, Subdomain, subdomain_ip_link
 from app.db.schemas import IPCreate, PortCreate
+from app.scanner.httpx_wrapper import HttpxError
+from app.scanner.katana_wrapper import KatanaError
 from app.tasks.web_recon import (
     _resolve_host_ip_id,
     _run_web_recon,
@@ -267,3 +269,61 @@ async def test_run_web_recon_caps_endpoints_per_host(db_session: AsyncSession) -
     assert result["endpoints"] == 500
     web_techs = await crud.get_web_techs_by_ip(db_session, record.id)
     assert len(web_techs[0].endpoints) == 500
+
+
+@pytest.mark.asyncio
+async def test_run_web_recon_keeps_httpx_data_when_katana_fails(
+    db_session: AsyncSession,
+) -> None:
+    record = await crud.create_ip(db_session, IPCreate(ip_address="10.1.1.1"))
+    await crud.create_port(
+        db_session,
+        PortCreate(ip_id=record.id, port_number=443, protocol="tcp", service="https"),
+    )
+    httpx_records = [
+        {
+            "url": "https://10.1.1.1:443",
+            "status_code": 200,
+            "title": "Kept",
+            "tech": ["nginx"],
+            "web_server": "nginx/1.25",
+        }
+    ]
+
+    with (
+        _patch_db(db_session),
+        patch("app.tasks.web_recon.run_httpx", new_callable=AsyncMock) as httpx_mock,
+        patch("app.tasks.web_recon.run_katana", new_callable=AsyncMock) as katana_mock,
+    ):
+        httpx_mock.return_value = httpx_records
+        katana_mock.side_effect = KatanaError("katana timed out after 600s")
+        result = await _run_web_recon("10.1.1.1")
+
+    assert result["status"] == "success"
+    assert result["web_techs"] == 1
+    assert result["endpoints"] == 0
+
+    web_techs = await crud.get_web_techs_by_ip(db_session, record.id)
+    assert len(web_techs) == 1
+    assert web_techs[0].title == "Kept"
+    assert web_techs[0].endpoints == []
+
+
+@pytest.mark.asyncio
+async def test_run_web_recon_reports_httpx_failure(db_session: AsyncSession) -> None:
+    record = await crud.create_ip(db_session, IPCreate(ip_address="10.2.2.2"))
+    await crud.create_port(
+        db_session,
+        PortCreate(ip_id=record.id, port_number=80, protocol="tcp", service="http"),
+    )
+
+    with (
+        _patch_db(db_session),
+        patch("app.tasks.web_recon.run_httpx", new_callable=AsyncMock) as httpx_mock,
+    ):
+        httpx_mock.side_effect = HttpxError("httpx failed with exit code 1")
+        result = await _run_web_recon("10.2.2.2")
+
+    assert result["status"] == "failed"
+    assert "httpx" in result["reason"]
+    assert result["web_techs"] == 0

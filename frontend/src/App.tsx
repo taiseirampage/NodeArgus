@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState, type ReactElement } from 'react'
-import { ScanForm } from './components/ScanForm'
-import { NetworkGraph, type GraphNode } from './components/NetworkGraph'
-import { NodeDetailsPanel, type SelectedNode } from './components/NodeDetailsPanel'
+import { MapView, type MapAsset } from './components/MapView'
+import { FloatingPanel, type ViewMode } from './components/FloatingPanel'
+import { TopologyView } from './components/TopologyView'
 import { TaskStatus } from './components/TaskStatus'
+import { NodeDetailsPanel, type SelectedNode } from './components/NodeDetailsPanel'
 
 const SCANNED_IPS_STORAGE_KEY = 'nodeargus.scannedIps'
+const VIEW_MODE_STORAGE_KEY = 'nodeargus.viewMode'
 
 function loadScannedIps(): string[] {
   try {
@@ -18,19 +20,26 @@ function loadScannedIps(): string[] {
   }
 }
 
-function toSelectedNode(node: GraphNode): SelectedNode {
+function loadViewMode(): ViewMode {
+  try {
+    const stored = window.localStorage.getItem(VIEW_MODE_STORAGE_KEY)
+    if (stored === 'map' || stored === 'topology') return stored
+  } catch {
+    /* localStorage unavailable; fall back to the map. */
+  }
+  return 'map'
+}
+
+function mapAssetToSelectedNode(asset: MapAsset): SelectedNode {
   return {
-    id: node.id,
-    node_type: node.node_type,
-    source: node.source ?? null,
-    resolved_ips: node.resolved_ips ?? [],
-    country: node.country ?? null,
-    city: node.city ?? null,
-    os: node.os ?? null,
-    ports_count: node.ports_count ?? 0,
-    asn_number: node.asn_number ?? null,
-    asn_cidr: node.asn_cidr ?? null,
-    asn_org: node.asn_org ?? null,
+    id: asset.ip,
+    node_type: 'ip',
+    source: null,
+    resolved_ips: [],
+    country: asset.country ?? null,
+    city: asset.city ?? null,
+    os: null,
+    ports_count: asset.ports_count,
   }
 }
 
@@ -38,15 +47,60 @@ function App(): ReactElement {
   const [scanTask, setScanTask] = useState<{ id: string; targetIp: string } | null>(null)
   const [scannedIps, setScannedIps] = useState<string[]>(loadScannedIps)
   const [selectedNode, setSelectedNode] = useState<SelectedNode | null>(null)
+  const [view, setView] = useState<ViewMode>(loadViewMode)
+  const [assetCount, setAssetCount] = useState(0)
+  const [focusIp, setFocusIp] = useState<string | null>(null)
+  const [mapRefreshKey, setMapRefreshKey] = useState(0)
+
   const handleGraphReady = useCallback((targetIp: string): void => {
     setScannedIps((currentIps) => [...currentIps.filter((ip) => ip !== targetIp), targetIp])
+    setMapRefreshKey((current) => current + 1)
   }, [])
-  const handleNodeClick = useCallback((node: GraphNode): void => {
-    setSelectedNode(toSelectedNode(node))
+
+  const handleNodeClick = useCallback((node: { id: string; node_type: SelectedNode['node_type']; source: string | null; resolved_ips: string[]; country: string | null; city: string | null; os: string | null; ports_count: number; asn_number?: string | null; asn_cidr?: string | null; asn_org?: string | null }): void => {
+    setSelectedNode({
+      id: node.id,
+      node_type: node.node_type,
+      source: node.source ?? null,
+      resolved_ips: node.resolved_ips ?? [],
+      country: node.country ?? null,
+      city: node.city ?? null,
+      os: node.os ?? null,
+      ports_count: node.ports_count ?? 0,
+      asn_number: node.asn_number ?? null,
+      asn_cidr: node.asn_cidr ?? null,
+      asn_org: node.asn_org ?? null,
+    })
   }, [])
+
   const clearGraph = useCallback((): void => {
     setScannedIps([])
     setSelectedNode(null)
+  }, [])
+
+  const handleViewChange = useCallback((nextView: ViewMode): void => {
+    setView(nextView)
+    try {
+      window.localStorage.setItem(VIEW_MODE_STORAGE_KEY, nextView)
+    } catch {
+      /* Persisting the view is best-effort. */
+    }
+  }, [])
+
+  const handleAssetsLoaded = useCallback((count: number): void => {
+    setAssetCount(count)
+  }, [])
+
+  const handleSelectAsset = useCallback((asset: MapAsset): void => {
+    setSelectedNode(mapAssetToSelectedNode(asset))
+  }, [])
+
+  const handleSearch = useCallback((ip: string): void => {
+    setFocusIp(ip)
+  }, [])
+
+  const handleFocusHandled = useCallback((): void => {
+    setFocusIp(null)
   }, [])
 
   useEffect(() => {
@@ -57,84 +111,44 @@ function App(): ReactElement {
     window.localStorage.setItem(SCANNED_IPS_STORAGE_KEY, JSON.stringify(scannedIps))
   }, [scannedIps])
 
-  const latestScannedIp = scannedIps[scannedIps.length - 1] ?? null
-
   return (
-    <main className="relative min-h-screen overflow-hidden px-5 py-6 text-slate-100 sm:px-8 sm:py-10">
-      <div className="pointer-events-none absolute inset-0 bg-grid opacity-40" />
-      <div className="pointer-events-none absolute -left-24 top-[-10rem] h-96 w-96 rounded-full bg-cyan-400/10 blur-3xl" />
-      <div className="pointer-events-none absolute -right-32 bottom-[-12rem] h-[30rem] w-[30rem] rounded-full bg-emerald-400/10 blur-3xl" />
+    <main className="relative h-screen w-full overflow-hidden bg-slate-950 text-slate-100">
+      {view === 'map' ? (
+        <MapView
+          onSelectAsset={handleSelectAsset}
+          onAssetsLoaded={handleAssetsLoaded}
+          focusIp={focusIp}
+          onFocusHandled={handleFocusHandled}
+          refreshKey={mapRefreshKey}
+        />
+      ) : (
+        <TopologyView
+          scanTask={scanTask}
+          scannedIps={scannedIps}
+          onGraphReady={handleGraphReady}
+          onNodeClick={handleNodeClick}
+          onClearGraph={clearGraph}
+        />
+      )}
 
-      <div className="relative mx-auto max-w-6xl">
-        <header className="mb-12 flex items-start justify-between gap-6">
-          <div>
-            <div className="mb-4 flex items-center gap-3 font-mono text-xs uppercase tracking-[0.28em] text-cyan-300">
-              <span className="h-2 w-2 rounded-full bg-cyan-300 shadow-[0_0_16px_#67e8f9]" />
-              NodeArgus / Operations
-            </div>
-            <h1 className="max-w-3xl font-display text-4xl font-semibold tracking-[-0.05em] text-white sm:text-6xl">
-              See what is awake
-              <span className="text-cyan-300">.</span>
-            </h1>
-            <p className="mt-5 max-w-xl text-base leading-7 text-slate-400 sm:text-lg">
-              Launch a controlled network scan and watch its signal move through the pipeline in real time.
-            </p>
-          </div>
-          <div className="hidden rounded-full border border-emerald-300/20 bg-emerald-300/5 px-4 py-2 font-mono text-[11px] uppercase tracking-[0.18em] text-emerald-300 sm:block">
-            System ready
-          </div>
-        </header>
+      <FloatingPanel
+        view={view}
+        onViewChange={handleViewChange}
+        assetCount={assetCount}
+        onScanSubmitted={(id, targetIp) => setScanTask({ id, targetIp })}
+        onSearch={handleSearch}
+      />
 
-        <section className="grid gap-5 lg:grid-cols-[1.15fr_0.85fr]">
-          <div className="panel-glow rounded-3xl border border-white/10 bg-slate-950/75 p-6 shadow-2xl shadow-black/20 backdrop-blur-xl sm:p-8">
-            <div className="mb-8 flex items-center justify-between">
-              <div>
-                <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-slate-500">01 / New operation</p>
-                <h2 className="mt-2 font-display text-2xl font-medium text-white">Target definition</h2>
-              </div>
-              <span className="rounded-lg border border-white/10 px-2.5 py-1 font-mono text-[10px] text-slate-500">ASYNC</span>
-            </div>
-            <ScanForm onTaskCreated={(id, targetIp) => setScanTask({ id, targetIp })} />
-          </div>
-
+      {view === 'map' && scanTask && (
+        <div className="absolute right-4 top-16 z-[900] w-80 max-w-[calc(100vw-3rem)]">
           <TaskStatus
-            taskId={scanTask?.id ?? null}
-            targetIp={scanTask?.targetIp ?? null}
+            taskId={scanTask.id}
+            targetIp={scanTask.targetIp}
             onSuccess={handleGraphReady}
           />
-        </section>
+        </div>
+      )}
 
-        {scannedIps.length > 0 && (
-          <section className="mt-5 rounded-3xl border border-white/10 bg-slate-950/75 p-6 shadow-2xl shadow-black/20 backdrop-blur-xl sm:p-8">
-            <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-              <div>
-                <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-slate-500">03 / Network topology</p>
-                <h2 className="mt-2 font-display text-2xl font-medium text-white">Live neighborhood</h2>
-              </div>
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="font-mono text-xs text-cyan-300">targets // {scannedIps.length}</span>
-                <button
-                  type="button"
-                  onClick={clearGraph}
-                  className="rounded-lg border border-rose-300/20 px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-rose-200 transition hover:border-rose-300/50 hover:bg-rose-300/10"
-                >
-                  Очистить граф
-                </button>
-              </div>
-            </div>
-            <NetworkGraph
-              allScannedIps={scannedIps}
-              latestScannedIp={latestScannedIp}
-              onNodeClick={handleNodeClick}
-            />
-          </section>
-        )}
-
-        <footer className="mt-10 flex flex-col gap-2 border-t border-white/10 pt-5 font-mono text-[10px] uppercase tracking-[0.18em] text-slate-600 sm:flex-row sm:items-center sm:justify-between">
-          <span>NodeArgus // Scan control interface</span>
-          <span>Local development channel · v0.1.0</span>
-        </footer>
-      </div>
       <NodeDetailsPanel
         node={selectedNode}
         onClose={() => setSelectedNode(null)}

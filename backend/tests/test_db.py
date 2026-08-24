@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.v1.endpoints.ip import get_ip_details
 from app.db import crud
-from app.db.models import Base
+from app.db.models import Base, WebTech
 from app.db.schemas import IPCreate, LinkCreate, PortCreate
 from app.geo.models import GeoLocation
 from app.scanner.models import NmapResult, NmapService
@@ -82,6 +82,30 @@ async def test_get_ip_details_returns_404(db_session: AsyncSession) -> None:
         await get_ip_details("192.168.1.10", db_session)
 
     assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_ip_details_tolerates_null_web_tech_technologies(
+    db_session: AsyncSession,
+) -> None:
+    record = await crud.create_ip(db_session, IPCreate(ip_address="192.168.1.11"))
+    db_session.add(
+        WebTech(
+            ip_id=record.id,
+            url="https://example.com",
+            status_code=200,
+            title=None,
+            technologies=None,
+            web_server=None,
+        )
+    )
+    await db_session.commit()
+
+    response = await get_ip_details("192.168.1.11", db_session)
+
+    assert len(response.web_techs) == 1
+    assert response.web_techs[0].url == "https://example.com"
+    assert response.web_techs[0].technologies == []
 
 
 @pytest.mark.asyncio

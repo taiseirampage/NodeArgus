@@ -90,7 +90,7 @@ describe('NodeDetailsPanel request lifecycle', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledTimes(3)
-    expect(screen.getByText('Сканирование...')).toBeTruthy()
+    expect(screen.getAllByText('Сканирование...').length).toBeGreaterThan(0)
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000)

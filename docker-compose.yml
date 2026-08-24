@@ -67,6 +67,9 @@ services:
       ALLOW_ACTIVE_RECON: ${ALLOW_ACTIVE_RECON:-false}
       AMASS_CONF_PATH: ${AMASS_CONF_PATH:-/root/.config/amass/config.yaml}
       AMASS_WORDLIST_PATH: ${AMASS_WORDLIST_PATH:-/usr/share/wordlists/amass/subdomains-top1mil-5000.txt}
+      ALLOW_WAF_BYPASS: ${ALLOW_WAF_BYPASS:-false}
+      WAF_BYPASS_RATE_LIMIT: ${WAF_BYPASS_RATE_LIMIT:-150}
+      WAF_BYPASS_CONCURRENCY: ${WAF_BYPASS_CONCURRENCY:-30}
     depends_on:
       postgres:
         condition: service_healthy
@@ -110,6 +113,9 @@ services:
       ALLOW_ACTIVE_RECON: ${ALLOW_ACTIVE_RECON:-false}
       AMASS_CONF_PATH: ${AMASS_CONF_PATH:-/root/.config/amass/config.yaml}
       AMASS_WORDLIST_PATH: ${AMASS_WORDLIST_PATH:-/usr/share/wordlists/amass/subdomains-top1mil-5000.txt}
+      ALLOW_WAF_BYPASS: ${ALLOW_WAF_BYPASS:-false}
+      WAF_BYPASS_RATE_LIMIT: ${WAF_BYPASS_RATE_LIMIT:-150}
+      WAF_BYPASS_CONCURRENCY: ${WAF_BYPASS_CONCURRENCY:-30}
     depends_on:
       postgres:
         condition: service_healthy

@@ -101,6 +101,19 @@ class WebTechResponse(BaseModel):
     discovered_at: datetime
     endpoints: list[EndpointResponse] = Field(default_factory=list)
 
+    @field_validator("technologies", mode="before")
+    @classmethod
+    def normalize_technologies(cls, value: object) -> list[object]:
+        """Coerce legacy ``NULL`` JSON columns to an empty list.
+
+        Older rows write ``technologies = NULL`` when a probe reported no
+        tech stack; pydantic only applies the default for missing fields, so
+        an explicit ``None`` must be normalized here.
+        """
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -139,3 +152,23 @@ class VulnerabilityResponse(VulnerabilityCreate):
     found_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MapAssetResponse(BaseModel):
+    """One geolocated IP record with a scan summary for the map view."""
+
+    ip: str
+    latitude: float
+    longitude: float
+    country: str | None = None
+    country_code: str | None = None
+    city: str | None = None
+    ports_count: int = 0
+    max_severity: str | None = None
+
+
+class MapAssetsResponse(BaseModel):
+    """The collection of geolocated assets returned by ``/map/assets``."""
+
+    count: int
+    assets: list[MapAssetResponse]

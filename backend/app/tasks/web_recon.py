@@ -2,7 +2,7 @@ import asyncio
 import ipaddress
 import logging
 import socket
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from celery import Task
@@ -10,8 +10,8 @@ from celery import Task
 from app.celery_worker import celery_app
 from app.db import crud
 from app.db.database import AsyncSessionLocal
-from app.scanner.httpx_wrapper import run_httpx
-from app.scanner.katana_wrapper import run_katana
+from app.scanner.httpx_wrapper import HttpxError, run_httpx
+from app.scanner.katana_wrapper import KatanaError, run_katana
 from app.scanner.validator import validate_domain
 
 from app.tasks.scan import _run_async
@@ -133,7 +133,7 @@ async def _run_web_recon(
                     "target": ip,
                 }
         else:
-            targets = await _targets_for_domain(db, domain)
+            targets = await _targets_for_domain(db, cast(str, domain))
 
         if not targets:
             return {
@@ -142,7 +142,17 @@ async def _run_web_recon(
                 "target": target,
             }
 
-        httpx_records = await run_httpx(targets)
+        try:
+            httpx_records = await run_httpx(targets)
+        except (HttpxError, ValueError) as error:
+            logger.warning("httpx failed for %s: %s", target, error)
+            return {
+                "status": "failed",
+                "reason": str(error),
+                "target": target,
+                "web_techs": 0,
+                "endpoints": 0,
+            }
         if not httpx_records:
             return {
                 "status": "success",
@@ -179,7 +189,15 @@ async def _run_web_recon(
 
         endpoints_by_origin: dict[str, list[dict[str, Any]]] = {}
         if crawl_urls:
-            katana_records = await run_katana(crawl_urls)
+            try:
+                katana_records = await run_katana(crawl_urls)
+            except (KatanaError, ValueError) as error:
+                katana_records = []
+                logger.warning(
+                    "katana crawl failed for %s; keeping httpx results: %s",
+                    target,
+                    error,
+                )
             for record in katana_records:
                 endpoint = record.get("endpoint")
                 if not isinstance(endpoint, str):

@@ -895,3 +895,79 @@ async def get_web_techs_by_ip(db: AsyncSession, ip_id: int) -> list[WebTech]:
     )
     result = await db.execute(statement)
     return list(result.scalars().all())
+
+
+async def get_map_assets(db: AsyncSession) -> list[dict[str, Any]]:
+    """Return IPs with valid coordinates, port counts, and max vulnerability.
+
+    Only IPs that have both latitude and longitude are returned so the map never
+    renders a marker without a location. Port counts and the highest-severity
+    vulnerability are aggregated per IP in two grouped queries to avoid N+1
+    fetch patterns.
+
+    Args:
+        db: An active database session.
+
+    Returns:
+        A list of dicts with ``ip``, ``latitude``, ``longitude``, ``country``,
+        ``country_code``, ``city``, ``ports_count`` and ``max_severity``
+        (``None`` for clean IPs). Ordered by IP address.
+    """
+    ip_entries = list(
+        await db.scalars(
+            select(IP)
+            .where(IP.latitude.is_not(None), IP.longitude.is_not(None))
+            .order_by(IP.ip_address)
+        )
+    )
+    if not ip_entries:
+        return []
+    ip_ids = [record.id for record in ip_entries]
+
+    port_counts: dict[int, int] = {}
+    port_rows = await db.execute(
+        select(Port.ip_id, func.count(Port.id))
+        .where(Port.ip_id.in_(ip_ids))
+        .group_by(Port.ip_id)
+    )
+    for ip_id, count in port_rows:
+        port_counts[int(ip_id)] = int(count)
+
+    severity_rank = case(
+        (Vulnerability.severity == "critical", 5),
+        (Vulnerability.severity == "high", 4),
+        (Vulnerability.severity == "medium", 3),
+        (Vulnerability.severity == "low", 2),
+        (Vulnerability.severity == "info", 1),
+        else_=0,
+    )
+    max_severity_by_ip: dict[int, str | None] = {}
+    rank_to_severity: dict[int, str] = {
+        5: "critical",
+        4: "high",
+        3: "medium",
+        2: "low",
+        1: "info",
+    }
+    severity_rows = await db.execute(
+        select(Vulnerability.ip_id, func.max(severity_rank))
+        .where(Vulnerability.ip_id.in_(ip_ids))
+        .group_by(Vulnerability.ip_id)
+    )
+    for ip_id, rank in severity_rows:
+        if ip_id is not None and int(rank) in rank_to_severity:
+            max_severity_by_ip[int(ip_id)] = rank_to_severity[int(rank)]
+
+    return [
+        {
+            "ip": str(record.ip_address),
+            "latitude": record.latitude,
+            "longitude": record.longitude,
+            "country": record.country,
+            "country_code": record.country_code,
+            "city": record.city,
+            "ports_count": port_counts.get(record.id, 0),
+            "max_severity": max_severity_by_ip.get(record.id),
+        }
+        for record in ip_entries
+    ]

@@ -102,6 +102,59 @@ def _write_target_list(urls: list[str]) -> str:
     return handle.name
 
 
+async def _stream_output(
+    process: asyncio.subprocess.Process, timeout: int
+) -> tuple[str, str, bool]:
+    """Read katana stdout/stderr until EOF or the deadline, whichever is first.
+
+    katana can generate a very large endpoint stream and only exits after its
+    own idle timeout, so waiting for a clean exit would discard already-produced
+    JSONL. Reading stdout progressively lets the caller persist partial results
+    when the hard wall-clock deadline is reached.
+
+    Args:
+        process: The running katana subprocess.
+        timeout: Hard wall-clock deadline in seconds.
+
+    Returns:
+        ``(stdout_text, stderr_text, timed_out)``. ``timed_out`` is True when the
+        deadline was reached before the process exited.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    stdout_chunks: list[bytes] = []
+    timed_out = False
+    if process.stdout is None:
+        process.kill()
+        await process.communicate()
+        return "", "", True
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            chunk = await asyncio.wait_for(process.stdout.read(4096), timeout=remaining)
+        except asyncio.TimeoutError:
+            timed_out = True
+            break
+        if not chunk:
+            break
+        stdout_chunks.append(chunk)
+
+    stderr_text = ""
+    if not timed_out and process.stderr is not None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining > 0:
+            stderr_text = (
+                await asyncio.wait_for(process.stderr.read(), timeout=remaining)
+            ).decode("utf-8", errors="replace")
+    if timed_out:
+        process.kill()
+    await asyncio.wait_for(process.communicate(), timeout=5)
+    stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+    return stdout, stderr_text, timed_out
+
+
 async def run_katana(urls: list[str]) -> list[dict[str, Any]]:
     """Crawl web URLs with katana and return normalized JSONL endpoint records.
 
@@ -115,12 +168,13 @@ async def run_katana(urls: list[str]) -> list[dict[str, Any]]:
 
     Returns:
         A list of dicts with ``endpoint``, ``method``, ``source`` and
-        ``timestamp``, deduplicated by endpoint. Returns an empty list when
-        nothing was discovered.
+        ``timestamp``, deduplicated by endpoint. Returns partial results when
+        the crawl hits its wall-clock timeout.
 
     Raises:
         ValueError: If a URL is unsafe or malformed.
-        KatanaError: If katana fails, times out, or is not installed.
+        KatanaError: If katana fails, times out while spawning, or is not
+            installed.
     """
     if not urls:
         raise ValueError("urls must not be empty")
@@ -162,19 +216,18 @@ async def run_katana(urls: list[str]) -> list[dict[str, Any]]:
         except FileNotFoundError as error:
             raise KatanaError("katana binary is not installed") from error
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=KATANA_TIMEOUT_SECONDS
+        stdout_text, stderr_text, timed_out = await _stream_output(
+            process, KATANA_TIMEOUT_SECONDS
+        )
+        if timed_out:
+            logger.warning(
+                "katana timed out after %ds; persisting partial results",
+                KATANA_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError as error:
-            process.kill()
-            await process.wait()
-            raise KatanaError(
-                f"katana timed out after {KATANA_TIMEOUT_SECONDS}s"
-            ) from error
+            return _normalize_records(_parse_jsonl(stdout_text))
 
         if process.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            stderr_text = stderr_text.strip()
             logger.error(
                 "katana failed with exit code %d: %s",
                 process.returncode,
@@ -185,7 +238,6 @@ async def run_katana(urls: list[str]) -> list[dict[str, Any]]:
                 f"{stderr_text or 'unknown error'}"
             )
 
-        stdout_text = stdout.decode("utf-8", errors="replace")
         records = _normalize_records(_parse_jsonl(stdout_text))
         logger.info("katana completed: %d endpoints discovered", len(records))
         return records

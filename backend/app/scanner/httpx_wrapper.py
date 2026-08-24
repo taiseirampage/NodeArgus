@@ -73,6 +73,58 @@ def _write_target_list(targets: list[str]) -> str:
     return handle.name
 
 
+async def _stream_output(
+    process: asyncio.subprocess.Process, timeout: int
+) -> tuple[str, str, bool]:
+    """Read httpx stdout/stderr until EOF or the deadline, whichever is first.
+
+    Probing many targets can take longer than the wall-clock timeout; reading
+    stdout progressively lets the caller persist whatever JSONL was already
+    produced instead of discarding everything on timeout.
+
+    Args:
+        process: The running httpx subprocess.
+        timeout: Hard wall-clock deadline in seconds.
+
+    Returns:
+        ``(stdout_text, stderr_text, timed_out)``. ``timed_out`` is True when the
+        deadline was reached before the process exited.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    stdout_chunks: list[bytes] = []
+    timed_out = False
+    if process.stdout is None:
+        process.kill()
+        await process.communicate()
+        return "", "", True
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            chunk = await asyncio.wait_for(process.stdout.read(4096), timeout=remaining)
+        except asyncio.TimeoutError:
+            timed_out = True
+            break
+        if not chunk:
+            break
+        stdout_chunks.append(chunk)
+
+    stderr_text = ""
+    if not timed_out and process.stderr is not None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining > 0:
+            stderr_text = (
+                await asyncio.wait_for(process.stderr.read(), timeout=remaining)
+            ).decode("utf-8", errors="replace")
+    if timed_out:
+        process.kill()
+    await asyncio.wait_for(process.communicate(), timeout=5)
+    stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+    return stdout, stderr_text, timed_out
+
+
 async def run_httpx(targets: list[str]) -> list[dict[str, Any]]:
     """Probe web targets with httpx and return normalized JSONL records.
 
@@ -88,12 +140,13 @@ async def run_httpx(targets: list[str]) -> list[dict[str, Any]]:
 
     Returns:
         A list of dicts with ``url``, ``status_code``, ``title``, ``tech``
-        (list), ``web_server`` and ``content_length``. Returns an empty list
-        when nothing responded.
+        (list), ``web_server`` and ``content_length``. Returns partial results
+        when probing hits its wall-clock timeout.
 
     Raises:
         ValueError: If a target is unsafe or malformed.
-        HttpxError: If httpx fails, times out, or is not installed.
+        HttpxError: If httpx fails, times out while spawning, or is not
+            installed.
     """
     if not targets:
         raise ValueError("targets must not be empty")
@@ -132,19 +185,18 @@ async def run_httpx(targets: list[str]) -> list[dict[str, Any]]:
         except FileNotFoundError as error:
             raise HttpxError("httpx binary is not installed") from error
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=HTTTPX_TIMEOUT_SECONDS
+        stdout_text, stderr_text, timed_out = await _stream_output(
+            process, HTTTPX_TIMEOUT_SECONDS
+        )
+        if timed_out:
+            logger.warning(
+                "httpx timed out after %ds; persisting partial results",
+                HTTTPX_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError as error:
-            process.kill()
-            await process.wait()
-            raise HttpxError(
-                f"httpx timed out after {HTTTPX_TIMEOUT_SECONDS}s"
-            ) from error
+            return _normalize_records(_parse_jsonl(stdout_text))
 
         if process.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            stderr_text = stderr_text.strip()
             logger.error(
                 "httpx failed with exit code %d: %s",
                 process.returncode,
@@ -155,7 +207,6 @@ async def run_httpx(targets: list[str]) -> list[dict[str, Any]]:
                 f"{stderr_text or 'unknown error'}"
             )
 
-        stdout_text = stdout.decode("utf-8", errors="replace")
         records = _normalize_records(_parse_jsonl(stdout_text))
         logger.info("httpx completed: %d live web hosts", len(records))
         return records

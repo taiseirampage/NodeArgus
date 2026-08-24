@@ -1,6 +1,7 @@
 import asyncio
+import io
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -10,6 +11,24 @@ from app.scanner.httpx_wrapper import (
     _parse_jsonl,
     run_httpx,
 )
+
+
+def _make_stream(data: str) -> MagicMock:
+    """Return a stream whose ``read`` yields the data once, then EOF."""
+    stream = MagicMock()
+    reader = io.BytesIO(data.encode())
+    stream.read = AsyncMock(side_effect=[reader.read(4096), b""])
+    return stream
+
+
+def _exec_result(returncode: int, stdout: str) -> SimpleNamespace:
+    process = SimpleNamespace()
+    process.returncode = returncode
+    process.stdout = _make_stream(stdout)
+    process.stderr = _make_stream("")
+    process.kill = MagicMock()
+    process.communicate = AsyncMock(return_value=(b"", b""))
+    return process
 
 
 def test_parse_jsonl_ignores_empty_and_malformed_lines() -> None:
@@ -62,10 +81,8 @@ def test_normalize_ignores_non_list_tech() -> None:
 
 @pytest.mark.asyncio
 async def test_run_httpx_writes_targets_to_list_and_parses_stdout() -> None:
-    process = SimpleNamespace(
-        returncode=0,
-        stdout=b'{"url":"http://1.2.3.4:80","status_code":200,"title":"T"}\n',
-        stderr=b"",
+    process = _exec_result(
+        0, '{"url":"http://1.2.3.4:80","status_code":200,"title":"T"}\n'
     )
     with (
         patch(
@@ -77,11 +94,7 @@ async def test_run_httpx_writes_targets_to_list_and_parses_stdout() -> None:
             "app.scanner.httpx_wrapper._write_target_list",
             return_value="/tmp/fake-httpx.txt",
         ) as write_list,
-        patch.object(
-            process, "communicate", new_callable=AsyncMock, create=True
-        ) as comm,
     ):
-        comm.return_value = (process.stdout, process.stderr)
         records = await run_httpx(["http://1.2.3.4:80"])
 
     args = list(create.call_args.args)
@@ -129,17 +142,44 @@ async def test_run_httpx_times_out_while_spawning() -> None:
 
 @pytest.mark.asyncio
 async def test_run_httpx_raises_on_nonzero_exit() -> None:
-    process = SimpleNamespace(returncode=2, stdout=b"", stderr=b"fatal")
+    process = _exec_result(2, "")
+    process.stderr = _make_stream("fatal")
     with (
         patch(
             "app.scanner.httpx_wrapper.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
             return_value=process,
         ),
-        patch.object(
-            process, "communicate", new_callable=AsyncMock, create=True
-        ) as comm,
     ):
-        comm.return_value = (process.stdout, process.stderr)
         with pytest.raises(HttpxError, match="exit code 2"):
             await run_httpx(["https://example.com"])
+
+
+@pytest.mark.asyncio
+async def test_run_httpx_returns_partial_results_when_timeout_hits() -> None:
+    process = SimpleNamespace()
+    process.returncode = 0
+    stdout_stream = asyncio.StreamReader()
+    stdout_stream.feed_data(
+        b'{"url":"http://1.2.3.4:80","status_code":200,"title":"T"}\n'
+    )
+    process.stdout = stdout_stream
+    process.stderr = _make_stream("")
+    process.kill = MagicMock()
+    process.communicate = AsyncMock(return_value=(b"", b""))
+    with (
+        patch("app.scanner.httpx_wrapper.HTTTPX_TIMEOUT_SECONDS", 0.05),
+        patch(
+            "app.scanner.httpx_wrapper.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ),
+        patch(
+            "app.scanner.httpx_wrapper._write_target_list",
+            return_value="/tmp/fake-httpx.txt",
+        ),
+    ):
+        records = await run_httpx(["http://1.2.3.4:80"])
+
+    assert records[0]["url"] == "http://1.2.3.4:80"
+    assert records[0]["status_code"] == 200

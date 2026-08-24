@@ -1,6 +1,7 @@
 import asyncio
+import io
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -13,6 +14,24 @@ from app.scanner.katana_wrapper import (
     _origin,
     run_katana,
 )
+
+
+def _make_stream(data: str) -> MagicMock:
+    """Return a stream whose ``read`` yields the data once, then EOF."""
+    stream = MagicMock()
+    reader = io.BytesIO(data.encode())
+    stream.read = AsyncMock(side_effect=[reader.read(4096), b""])
+    return stream
+
+
+def _exec_result(returncode: int, stdout: str) -> SimpleNamespace:
+    process = SimpleNamespace()
+    process.returncode = returncode
+    process.stdout = _make_stream(stdout)
+    process.stderr = _make_stream("")
+    process.kill = MagicMock()
+    process.communicate = AsyncMock(return_value=(b"", b""))
+    return process
 
 
 def test_parse_jsonl_ignores_empty_and_malformed_lines() -> None:
@@ -74,13 +93,10 @@ def test_normalize_falls_back_to_hostname_without_dot() -> None:
 
 @pytest.mark.asyncio
 async def test_run_katana_writes_urls_to_list_and_parses_stdout() -> None:
-    process = SimpleNamespace(
-        returncode=0,
-        stdout=(
-            b'{"request":{"method":"GET","endpoint":"https://a.com/login"}}\n'
-            b'{"request":{"method":"GET","endpoint":"https://a.com/register"}}\n'
-        ),
-        stderr=b"",
+    process = _exec_result(
+        0,
+        '{"request":{"method":"GET","endpoint":"https://a.com/login"}}\n'
+        '{"request":{"method":"GET","endpoint":"https://a.com/register"}}\n',
     )
     with (
         patch(
@@ -92,11 +108,7 @@ async def test_run_katana_writes_urls_to_list_and_parses_stdout() -> None:
             "app.scanner.katana_wrapper._write_target_list",
             return_value="/tmp/fake-katana.txt",
         ) as write_list,
-        patch.object(
-            process, "communicate", new_callable=AsyncMock, create=True
-        ) as comm,
     ):
-        comm.return_value = (process.stdout, process.stderr)
         records = await run_katana(["https://a.com"])
 
     args = list(create.call_args.args)
@@ -159,17 +171,43 @@ async def test_run_katana_times_out_while_spawning() -> None:
 
 @pytest.mark.asyncio
 async def test_run_katana_raises_on_nonzero_exit() -> None:
-    process = SimpleNamespace(returncode=3, stdout=b"", stderr=b"boom")
+    process = _exec_result(3, "")
+    process.stderr = _make_stream("boom")
     with (
         patch(
             "app.scanner.katana_wrapper.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
             return_value=process,
         ),
-        patch.object(
-            process, "communicate", new_callable=AsyncMock, create=True
-        ) as comm,
     ):
-        comm.return_value = (process.stdout, process.stderr)
         with pytest.raises(KatanaError, match="exit code 3"):
             await run_katana(["https://a.com"])
+
+
+@pytest.mark.asyncio
+async def test_run_katana_returns_partial_results_when_timeout_hits() -> None:
+    process = SimpleNamespace()
+    process.returncode = 0
+    stdout_stream = asyncio.StreamReader()
+    stdout_stream.feed_data(
+        b'{"request":{"method":"GET","endpoint":"https://a.com/login"}}\n'
+    )
+    process.stdout = stdout_stream
+    process.stderr = _make_stream("")
+    process.kill = MagicMock()
+    process.communicate = AsyncMock(return_value=(b"", b""))
+    with (
+        patch("app.scanner.katana_wrapper.KATANA_TIMEOUT_SECONDS", 0.05),
+        patch(
+            "app.scanner.katana_wrapper.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ),
+        patch(
+            "app.scanner.katana_wrapper._write_target_list",
+            return_value="/tmp/fake-katana.txt",
+        ),
+    ):
+        records = await run_katana(["https://a.com"])
+
+    assert [record["endpoint"] for record in records] == ["https://a.com/login"]

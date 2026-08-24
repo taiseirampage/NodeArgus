@@ -261,13 +261,16 @@ async def _persist_unified_recon(
     merged: list[dict[str, Any]],
     amass_result: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Resolve merged subdomains, save them, and return recon statistics."""
-    if not merged:
-        logger.info("No subdomains found for %s across tools", domain)
-        return {"domain": domain, "total_subdomains": 0, "unique_ips": 0}
+    """Resolve merged subdomains, save domain/ASN, and return recon statistics.
 
+    Even when no subdomains are discovered, the root domain and any Amass ASN
+    attribution are still persisted so the graph can render the domain with its
+    ASN ownership node instead of returning 404, and Amass-discovered IPs are
+    counted even when they are not attached to a subdomain.
+    """
     amass_resolved: dict[str, list[str]] = {}
     asn_info: list[dict[str, Any]] = []
+    amass_ips: set[str] = set()
     if amass_result and isinstance(amass_result, dict):
         raw_resolved = amass_result.get("resolved") or {}
         amass_resolved = {
@@ -277,19 +280,20 @@ async def _persist_unified_recon(
         }
         raw_asns = amass_result.get("asn_info") or []
         asn_info = [entry for entry in raw_asns if isinstance(entry, dict)]
+        raw_ips = amass_result.get("ip_addresses") or []
+        amass_ips = {str(ip) for ip in raw_ips if isinstance(ip, str)}
 
     enriched = await _unified_resolve(merged, amass_resolved)
     async with AsyncSessionLocal() as db:
         counts = await crud.save_unified_recon_results(db, domain, enriched, asn_info)
 
-    unique_ips = len(
-        {ip for record in enriched for ip in record.get("ip_addresses", [])}
-    )
+    resolved_ips = {ip for record in enriched for ip in record.get("ip_addresses", [])}
+    resolved_ips.update(amass_ips)
     tools_used = sorted({label for record in merged for label in record["sources"]})
     return {
         "domain": domain,
         "total_subdomains": counts["subdomains"],
-        "unique_ips": unique_ips,
+        "unique_ips": len(resolved_ips),
         "tools_used": tools_used,
         "asn_info": asn_info,
     }
@@ -387,10 +391,10 @@ def run_unified_recon_task(
             tool_errors[tool] = str(value["error"])
             continue
         if tool == "subfinder" and isinstance(value, list):
-            if value and isinstance(value[0], str):
+            if not value or isinstance(value[0], str):
                 subfinder_names = value
             else:
-                tool_errors[tool] = "subfinder returned an empty result"
+                tool_errors[tool] = "subfinder returned malformed results"
         elif tool == "amass" and isinstance(value, dict):
             amass_result = value
 

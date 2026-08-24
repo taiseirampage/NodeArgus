@@ -100,6 +100,47 @@ async def test_persist_unified_recon_resolves_and_saves() -> None:
     assert by_name["b.example.com"]["ip_addresses"] == ["5.6.7.8"]
 
 
+@pytest.mark.asyncio
+async def test_persist_unified_recon_saves_asn_when_no_subdomains() -> None:
+    db = AsyncMock()
+    db.__aenter__.return_value = db
+    db.__aexit__.return_value = False
+    counts = {"subdomains": 0, "ip_links": 0, "asn_records": 1}
+    amass_result = {
+        "subdomains": [],
+        "resolved": {},
+        "asn_info": [{"asn_number": 49981, "description": "WORLDSTREAM"}],
+        "ip_addresses": ["89.39.104.183"],
+    }
+
+    with (
+        patch(
+            "app.tasks.recon._resolve_batches",
+            new_callable=AsyncMock,
+            return_value={},
+        ),
+        patch(
+            "app.tasks.recon.crud.save_unified_recon_results",
+            new_callable=AsyncMock,
+            return_value=counts,
+        ) as save,
+        patch("app.tasks.recon.AsyncSessionLocal", return_value=db),
+    ):
+        result = await _persist_unified_recon("p.porno365.broker", [], amass_result)
+
+    assert result == {
+        "domain": "p.porno365.broker",
+        "total_subdomains": 0,
+        "unique_ips": 1,
+        "tools_used": [],
+        "asn_info": [{"asn_number": 49981, "description": "WORLDSTREAM"}],
+    }
+    save.assert_called_once()
+    assert save.call_args.args[3] == [
+        {"asn_number": 49981, "description": "WORLDSTREAM"}
+    ]
+
+
 def test_unified_recon_invalid_domain_fails() -> None:
     with (
         patch("app.tasks.recon.validate_domain", side_effect=ValueError("bad")),
@@ -208,6 +249,50 @@ def test_unified_recon_dispatches_group_and_merges() -> None:
     assert result["tools_used"] == ["subfinder", "amass"]
     web_recon.delay.assert_called_once_with("example.com")
     assert result["web_recon_dispatched"] is True
+
+
+def test_unified_recon_empty_subfinder_is_not_an_error() -> None:
+    subfinder_child = MagicMock()
+    subfinder_child.state = "SUCCESS"
+    subfinder_child.ready.return_value = True
+    subfinder_child.result = []
+    amass_child = MagicMock()
+    amass_child.state = "SUCCESS"
+    amass_child.ready.return_value = True
+    amass_child.result = {"subdomains": [], "resolved": {}, "asn_info": []}
+    group_result = MagicMock()
+    group_result.results = [subfinder_child, amass_child]
+    group_result.apply_async.return_value = group_result
+    persisted = {
+        "domain": "p.porno365.broker",
+        "total_subdomains": 0,
+        "unique_ips": 0,
+        "tools_used": ["subfinder", "amass"],
+        "asn_info": [],
+    }
+
+    with (
+        patch("app.tasks.recon.validate_domain", return_value="p.porno365.broker"),
+        patch("app.tasks.recon.group", return_value=group_result),
+        patch(
+            "app.tasks.recon._persist_unified_recon",
+            new_callable=AsyncMock,
+            return_value=persisted,
+        ),
+        patch.object(run_unified_recon_task, "update_state"),
+        patch("app.tasks.recon._run_async", side_effect=asyncio.run),
+        patch("app.tasks.recon.time.sleep"),
+        patch("app.tasks.recon.run_web_recon_task") as web_recon,
+    ):
+        result = _execute_task(
+            "p.porno365.broker",
+            recon_tools=["subfinder", "amass"],
+            amass_mode="passive",
+        )
+
+    assert result["status"] == "success"
+    assert "tool_errors" not in result
+    web_recon.delay.assert_called_once_with("p.porno365.broker")
 
 
 def test_scan_request_ip_target_ignores_recon_tools() -> None:

@@ -8,6 +8,7 @@ from app.api.v1.endpoints.ip import router as ip_router
 from app.api.v1.endpoints.scan import router as scan_router
 from app.api.v1.endpoints.vuln import router as vuln_router
 from app.api.v1.endpoints.export import router as export_router
+from app.api.v1.endpoints.map import router as map_router
 
 
 app = FastAPI(title="NodeArgus", version="0.1.0")
@@ -26,6 +27,7 @@ app.include_router(ip_router)
 app.include_router(scan_router)
 app.include_router(vuln_router, prefix="/vuln", tags=["vulnerabilities"])
 app.include_router(export_router, prefix="/export", tags=["export"])
+app.include_router(map_router)
 
 
 if __name__ == "__main__":

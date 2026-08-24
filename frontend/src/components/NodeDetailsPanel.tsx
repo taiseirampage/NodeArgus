@@ -18,8 +18,10 @@ interface IpDetails {
   os: string | null
   provider: string | null
   scripts_info: Record<string, string>
+  has_anonymous_access: boolean
   traceroute: TracerouteHop[]
   ports: PortDetails[]
+  web_techs: WebTechDetails[]
 }
 
 interface TracerouteHop {
@@ -27,6 +29,25 @@ interface TracerouteHop {
   ip: string | null
   hostname: string | null
   rtt: string | null
+}
+
+interface WebTechDetails {
+  id: number
+  url: string
+  status_code: number | null
+  title: string | null
+  technologies: string[]
+  web_server: string | null
+  discovered_at: string
+  endpoints: WebEndpointDetails[]
+}
+
+interface WebEndpointDetails {
+  id: number
+  path: string
+  method: string
+  source: string | null
+  discovered_at: string
 }
 
 export interface Vulnerability {
@@ -86,6 +107,20 @@ const severityLabels: Record<Vulnerability['severity'], string> = {
   info: 'INFO',
 }
 
+const WEB_SCAN_TAG_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'wordpress', label: 'WordPress' },
+  { value: 'php', label: 'PHP' },
+  { value: 'nginx', label: 'Nginx' },
+  { value: 'apache', label: 'Apache' },
+  { value: 'laravel', label: 'Laravel' },
+  { value: 'django', label: 'Django' },
+  { value: 'misconfig', label: 'Misconfig' },
+  { value: 'exposure', label: 'Exposure' },
+  { value: 'cve', label: 'CVE' },
+  { value: 'default-login', label: 'Default login' },
+  { value: 'tech', label: 'Tech' },
+]
+
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
 }
@@ -120,6 +155,52 @@ function portStateClass(state: string): string {
   return 'text-gray-400'
 }
 
+const techPalette = [
+  'bg-cyan-400/10 text-cyan-300 border-cyan-400/30',
+  'bg-emerald-400/10 text-emerald-300 border-emerald-400/30',
+  'bg-violet-400/10 text-violet-300 border-violet-400/30',
+  'bg-amber-400/10 text-amber-300 border-amber-400/30',
+  'bg-rose-400/10 text-rose-300 border-rose-400/30',
+  'bg-sky-400/10 text-sky-300 border-sky-400/30',
+]
+
+function techBadgeClass(tech: string): string {
+  let hash = 0
+  for (const char of tech) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
+  return techPalette[hash % techPalette.length]
+}
+
+function statusCodeClass(code: number | null): string {
+  if (code === null) return 'text-gray-400'
+  if (code >= 200 && code < 300) return 'text-emerald-300'
+  if (code >= 300 && code < 400) return 'text-cyan-300'
+  if (code >= 400 && code < 500) return 'text-amber-300'
+  return 'text-rose-300'
+}
+
+function methodBadgeClass(method: string): string {
+  const upper = method.toUpperCase()
+  if (upper === 'GET') return 'bg-cyan-400/10 text-cyan-300'
+  if (upper === 'POST') return 'bg-amber-400/10 text-amber-300'
+  return 'bg-gray-500/20 text-gray-300'
+}
+
+async function copyToClipboard(
+  text: string,
+  setCopied: (value: string) => void,
+  setClear: (updater: (current: string | null) => string | null) => void,
+): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text)
+    setCopied(text)
+    window.setTimeout(() => {
+      setClear((current: string | null) => (current === text ? null : current))
+    }, 1500)
+  } catch {
+    /* Clipboard unavailable (e.g. non-HTTPS); the URL remains visible. */
+  }
+}
+
 export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): ReactElement | null {
   const [details, setDetails] = useState<IpDetails | null>(null)
   const [loading, setLoading] = useState(false)
@@ -131,7 +212,13 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
   const [vulnMessage, setVulnMessage] = useState<string | null>(null)
   const [isCancellingVuln, setIsCancellingVuln] = useState(false)
   const [scriptsExpanded, setScriptsExpanded] = useState(false)
+  const [webReconExpanded, setWebReconExpanded] = useState(true)
+  const [copiedUrl, setCopiedUrl] = useState<string | null>(null)
   const [useStealthMode, setUseStealthMode] = useState<boolean>(false)
+  const [useWafBypassMode, setUseWafBypassMode] = useState<boolean>(false)
+  const [webScanTags, setWebScanTags] = useState<string[]>([])
+  const [exportOpen, setExportOpen] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
   const vulnControllerRef = useRef<AbortController | null>(null)
 
   const isIpNode = node?.node_type === 'ip'
@@ -145,7 +232,12 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
     setVulnError(null)
     setVulnMessage(null)
     setIsCancellingVuln(false)
+    setWebScanTags([])
+    setExportOpen(false)
+    setExportError(null)
     setScriptsExpanded(false)
+    setWebReconExpanded(true)
+    setCopiedUrl(null)
 
     if (!node) {
       setDetails(null)
@@ -179,7 +271,9 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
         setDetails({
           ...payload,
           scripts_info: payload.scripts_info ?? {},
+          has_anonymous_access: payload.has_anonymous_access ?? false,
           traceroute: payload.traceroute ?? [],
+          web_techs: payload.web_techs ?? [],
         })
       } catch (requestError: unknown) {
         if (isAbortError(requestError)) return
@@ -212,6 +306,7 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
     try {
       const query = new URLSearchParams()
       if (useStealthMode) query.set('use_stealth_mode', 'true')
+      if (useWafBypassMode) query.set('waf_bypass_mode', 'true')
       const queryString = query.toString()
       const queueUrl = `${API_BASE_URL}/vuln/${encodeURIComponent(selectedIp)}${queryString ? `?${queryString}` : ''}`
       const queueResponse = await fetch(queueUrl, {
@@ -228,6 +323,51 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
       if (isAbortError(requestError)) return
       if (!controller.signal.aborted) {
         setVulnError(requestError instanceof Error ? requestError.message : 'Ошибка поиска уязвимостей.')
+        setIsScanningVuln(false)
+      }
+    } finally {
+      if (vulnControllerRef.current === controller && controller.signal.aborted) {
+        vulnControllerRef.current = null
+      }
+    }
+  }
+
+  async function startWebHostVulnerabilityScan(): Promise<void> {
+    if (!node || !isIpNode || isScanningVuln) return
+    if (!details || !details.web_techs || details.web_techs.length === 0) return
+
+    const selectedIp = node.id
+    const controller = new AbortController()
+    vulnControllerRef.current?.abort()
+    vulnControllerRef.current = controller
+    setIsScanningVuln(true)
+    setVulnTaskId(null)
+    setVulnerabilities(null)
+    setVulnError(null)
+    setVulnMessage(null)
+
+    try {
+      const query = new URLSearchParams()
+      if (useStealthMode) query.set('use_stealth_mode', 'true')
+      if (useWafBypassMode) query.set('waf_bypass_mode', 'true')
+      webScanTags.forEach((tag) => query.append('tags', tag))
+      const queryString = query.toString()
+      const queueUrl = `${API_BASE_URL}/vuln/${encodeURIComponent(selectedIp)}/web${queryString ? `?${queryString}` : ''}`
+      const queueResponse = await fetch(queueUrl, {
+        method: 'POST',
+        signal: controller.signal,
+      })
+      if (!queueResponse.ok) {
+        const body = (await queueResponse.json().catch(() => null)) as { detail?: string } | null
+        throw new Error(body?.detail ?? `Не удалось запустить сканирование веб-хостов: HTTP ${queueResponse.status}`)
+      }
+      const queued = (await queueResponse.json()) as VulnerabilityQueueResponse
+      setVulnTaskId(queued.task_id)
+      await pollVulnerabilityTask(selectedIp, queued.task_id, controller)
+    } catch (requestError: unknown) {
+      if (isAbortError(requestError)) return
+      if (!controller.signal.aborted) {
+        setVulnError(requestError instanceof Error ? requestError.message : 'Ошибка сканирования веб-хостов.')
         setIsScanningVuln(false)
       }
     } finally {
@@ -273,6 +413,35 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
     }
   }
 
+  async function downloadExport(kind: 'full' | 'ports' | 'vulns' | 'endpoints'): Promise<void> {
+    if (!node) return
+    const target = node.id.trim()
+    if (!target) return
+
+    const ext = kind === 'full' ? 'json' : 'csv'
+    const filename = `nodeargus_${target.replace(/[^\w.-]/g, '_')}_${kind}.${ext}`
+    setExportError(null)
+    setExportOpen(false)
+    try {
+      const response = await fetch(`${API_BASE_URL}/export/${encodeURIComponent(target)}/${kind}`)
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { detail?: string } | null
+        throw new Error(body?.detail ?? `Ошибка экспорта: HTTP ${response.status}`)
+      }
+      const blob = await response.blob()
+      const url = window.URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      window.URL.revokeObjectURL(url)
+    } catch (requestError: unknown) {
+      setExportError(requestError instanceof Error ? requestError.message : 'Не удалось скачать файл.')
+    }
+  }
+
   async function cancelVulnerabilityScan(): Promise<void> {
     if (!node || !isIpNode || !vulnTaskId || isCancellingVuln) return
 
@@ -315,14 +484,73 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
           <p className={`font-mono text-[10px] uppercase tracking-[0.2em] ${nodeAccent}`}>{nodeLabel}</p>
           <h2 className="mt-2 break-all font-mono text-lg font-semibold text-white">{node.id}</h2>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Закрыть панель"
-          className="rounded-lg px-2 py-1 text-2xl leading-none text-gray-400 transition hover:bg-gray-700 hover:text-white"
-        >
-          ×
-        </button>
+        <div className="flex items-start gap-2">
+          {(node.node_type === 'ip' || node.node_type === 'domain') && (
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setExportOpen((open) => !open)}
+                aria-haspopup="menu"
+                aria-expanded={exportOpen}
+                aria-label="Экспорт результатов"
+                className="rounded-lg border border-gray-600 px-2 py-1 text-lg leading-none text-gray-300 transition hover:border-cyan-400/60 hover:text-white"
+              >
+                ⬇️
+              </button>
+              {exportOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setExportOpen(false)} aria-hidden="true" />
+                  <div
+                    role="menu"
+                    className="absolute right-0 top-full z-50 mt-2 w-52 overflow-hidden rounded-xl border border-gray-600 bg-gray-900 text-left shadow-xl"
+                  >
+                    <p className="border-b border-gray-700 px-3 py-2 font-mono text-[10px] uppercase tracking-[0.18em] text-gray-500">Экспорт</p>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => void downloadExport('full')}
+                      className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-gray-200 transition hover:bg-gray-800"
+                    >
+                      <span aria-hidden="true">📄</span> Полный отчет (JSON)
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => void downloadExport('ports')}
+                      className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-gray-200 transition hover:bg-gray-800"
+                    >
+                      <span aria-hidden="true">📊</span> Порты (CSV)
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => void downloadExport('vulns')}
+                      className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-gray-200 transition hover:bg-gray-800"
+                    >
+                      <span aria-hidden="true">🛡️</span> Уязвимости (CSV)
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => void downloadExport('endpoints')}
+                      className="flex w-full items-center gap-2 px-3 py-2.5 text-sm text-gray-200 transition hover:bg-gray-800"
+                    >
+                      <span aria-hidden="true">🌐</span> Эндпоинты (CSV)
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Закрыть панель"
+            className="rounded-lg px-2 py-1 text-2xl leading-none text-gray-400 transition hover:bg-gray-700 hover:text-white"
+          >
+            ×
+          </button>
+        </div>
       </div>
 
       <div className="space-y-6 p-5">
@@ -330,6 +558,12 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
         {error && (
           <p className="rounded-lg border border-rose-400/30 bg-rose-400/10 p-3 text-sm text-rose-200" role="alert">
             {error}
+          </p>
+        )}
+
+        {exportError && (
+          <p className="rounded-lg border border-rose-400/30 bg-rose-400/10 p-3 text-sm text-rose-200" role="alert">
+            {exportError}
           </p>
         )}
 
@@ -481,6 +715,105 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
               )}
             </section>
 
+            <section>
+              <button
+                type="button"
+                className="flex w-full items-center justify-between border-b border-gray-700 pb-3 text-left"
+                onClick={() => setWebReconExpanded((expanded) => !expanded)}
+                aria-expanded={webReconExpanded}
+              >
+                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-gray-500">Web & Endpoints</span>
+                <span className="text-gray-500">{webReconExpanded ? '⌃' : '⌄'}</span>
+              </button>
+              {webReconExpanded && (
+                <div className="space-y-4 pt-4">
+                  {details.web_techs.length === 0 ? (
+                    <p className="rounded-xl border border-gray-700 bg-gray-900/50 p-4 text-sm leading-6 text-gray-400">
+                      Веб-ресурсы не обнаружены (httpx пробинг не проводился или не вернул живых хостов)
+                    </p>
+                  ) : (
+                    details.web_techs.map((tech) => (
+                      <article key={tech.id} className="overflow-hidden rounded-xl border border-gray-700 bg-gray-900/60">
+                        <div className="space-y-2 p-3">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                            <button
+                              type="button"
+                              onClick={() => void copyToClipboard(tech.url, setCopiedUrl, setCopiedUrl)}
+                              title="Скопировать URL"
+                              className={`max-w-full truncate break-all font-mono text-xs text-cyan-300 transition hover:text-cyan-200 ${copiedUrl === tech.url ? 'text-emerald-300' : ''}`}
+                            >
+                              {copiedUrl === tech.url ? '✓ Скопировано' : tech.url}
+                            </button>
+                            <span className={`font-mono text-[10px] font-semibold ${statusCodeClass(tech.status_code)}`}>
+                              {tech.status_code ?? '—'}
+                            </span>
+                          </div>
+                          {tech.title && (
+                            <p className="text-sm font-medium leading-5 text-gray-200">{tech.title}</p>
+                          )}
+                          {(tech.web_server || tech.technologies.length > 0) && (
+                            <div className="flex flex-wrap gap-1.5">
+                              {tech.web_server && (
+                                <span className="rounded-md border border-gray-600 bg-gray-700/50 px-2 py-0.5 font-mono text-[10px] text-gray-300">
+                                  {tech.web_server}
+                                </span>
+                              )}
+                              {tech.technologies.map((name) => (
+                                <span
+                                  key={name}
+                                  className={`rounded-md border px-2 py-0.5 font-mono text-[10px] ${techBadgeClass(name)}`}
+                                >
+                                  {name}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                        {tech.endpoints.length > 0 && (
+                          <div className="border-t border-gray-700/70">
+                            <table className="w-full text-left text-xs">
+                              <thead className="bg-gray-900 font-mono uppercase tracking-wider text-gray-500">
+                                <tr>
+                                  <th className="px-3 py-2">Метод</th>
+                                  <th className="px-3 py-2">Endpoint</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-gray-700/80">
+                                {tech.endpoints.map((endpoint) => (
+                                  <tr key={endpoint.id} className="bg-gray-800/40">
+                                    <td className="px-3 py-2 align-top">
+                                      <span className={`rounded-md px-1.5 py-0.5 font-mono text-[10px] font-semibold ${methodBadgeClass(endpoint.method)}`}>
+                                        {endpoint.method}
+                                      </span>
+                                    </td>
+                                    <td className="px-3 py-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => void copyToClipboard(endpoint.path, setCopiedUrl, setCopiedUrl)}
+                                        title="Скопировать endpoint"
+                                        className={`block max-w-full break-all text-left font-mono text-gray-300 transition hover:text-cyan-200 ${copiedUrl === endpoint.path ? 'text-emerald-300' : ''}`}
+                                      >
+                                        {endpoint.path}
+                                      </button>
+                                      {endpoint.source && (
+                                        <span className="mt-0.5 block break-all font-mono text-[10px] text-gray-500">
+                                          src: {endpoint.source}
+                                        </span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </article>
+                    ))
+                  )}
+                </div>
+              )}
+            </section>
+
             {Object.entries(details.scripts_info).some(([, output]) => output.trim().length > 0) && (
               <section>
                 <button
@@ -510,8 +843,12 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
                 <input
                   type="checkbox"
                   checked={useStealthMode}
-                  disabled={isScanningVuln || isCancellingVuln}
-                  onChange={(event) => setUseStealthMode(event.target.checked)}
+                  disabled={isScanningVuln || isCancellingVuln || useWafBypassMode}
+                  onChange={(event) => {
+                    const checked = event.target.checked
+                    setUseStealthMode(checked)
+                    if (checked) setUseWafBypassMode(false)
+                  }}
                   className="mt-0.5 h-4 w-4 accent-cyan-400"
                 />
                 <span>
@@ -524,6 +861,34 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
                   Stealth mode может увеличить время сканирования до 10-15 минут.
                 </p>
               )}
+
+              <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-orange-700/60 bg-orange-900/20 p-3 text-sm text-gray-300">
+                <input
+                  type="checkbox"
+                  checked={useWafBypassMode}
+                  disabled={isScanningVuln || isCancellingVuln || useStealthMode}
+                  onChange={(event) => {
+                    const checked = event.target.checked
+                    setUseWafBypassMode(checked)
+                    if (checked) setUseStealthMode(false)
+                  }}
+                  className="mt-0.5 h-4 w-4 accent-orange-400"
+                />
+                <span>
+                  <span className="font-medium text-gray-200">⚡ WAF Bypass Mode</span>
+                  <span className="mt-1 block text-xs leading-5 text-gray-500">
+                    Агрессивный обход WAF (Cloudflare, ModSecurity, AWS WAF)
+                  </span>
+                </span>
+              </label>
+              {useWafBypassMode && (
+                <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 p-3 text-xs leading-5 text-amber-100" role="note">
+                  WAF Bypass генерирует значительно больше трафика и может вызвать
+                  блокировку IP со стороны WAF, срабатывание IDS/IPS, нагрузку на
+                  целевой сервер и ложные срабатывания защиты (rate limiting, CAPTCHA).
+                  Требуется ALLOW_WAF_BYPASS=true в .env.
+                </p>
+              )}
               <button
                 type="button"
                 disabled={isScanningVuln}
@@ -533,6 +898,49 @@ export function NodeDetailsPanel({ node, onClose }: NodeDetailsPanelProps): Reac
                 {isScanningVuln && <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-950/30 border-t-gray-950" aria-hidden="true" />}
                 {isScanningVuln ? 'Сканирование...' : '🛡️ Запустить поиск уязвимостей'}
               </button>
+
+              <button
+                type="button"
+                disabled={isScanningVuln || details.web_techs.length === 0}
+                onClick={() => void startWebHostVulnerabilityScan()}
+                title={details.web_techs.length === 0 ? 'Сначала запустите web recon, чтобы обнаружить веб-хосты' : 'Nuclei по хостам из WebTech (виртуальные хосты)'}
+                className="flex w-full items-center justify-center gap-2 rounded-xl border border-orange-500/60 px-4 py-3 text-sm font-semibold text-orange-200 transition hover:bg-orange-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isScanningVuln ? 'Сканирование...' : `🕸️ Сканировать веб-хосты (${details.web_techs.length})`}
+              </button>
+
+              <div className="space-y-2 rounded-xl border border-gray-700 bg-gray-900/40 p-3">
+                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                  Теги веб-хостов (пусто = все шаблоны)
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  {WEB_SCAN_TAG_OPTIONS.map((option) => {
+                    const active = webScanTags.includes(option.value)
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        disabled={isScanningVuln}
+                        onClick={() => {
+                          setWebScanTags((current) =>
+                            active
+                              ? current.filter((tag) => tag !== option.value)
+                              : [...current, option.value],
+                          )
+                        }}
+                        aria-pressed={active}
+                        className={`rounded-md border px-2 py-1 font-mono text-[10px] transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                          active
+                            ? 'border-orange-400/60 bg-orange-400/10 text-orange-200'
+                            : 'border-gray-600 bg-gray-800/50 text-gray-400 hover:border-gray-500'
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
 
               {isScanningVuln && (
                 <>
